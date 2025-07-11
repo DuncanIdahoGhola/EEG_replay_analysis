@@ -158,7 +158,7 @@ icalabel_prob_threshold = 0.8
 # icalabel_labels_to_keep: List of labels to keep for icalabel, default is ['brain', 'other']
 icalabel_labels_to_keep = ['brain', 'other']
 # icalabel_n_jobs: Number of jobs to use for icalabel, default is 1
-icalabel_n_jobs = 3
+icalabel_n_jobs = 5
 # icalabel_subjects: List of subjects to process for icalabel, default is same as the rest of the pipeline
 icalabel_subjects = subjects
 # icalabel_keep_mnebids_bads: Set to True to keep the bad ica already flagged in the components.tsv file (e.g. visual inspection)
@@ -220,16 +220,15 @@ raw_resample_sfreq = 500
 
 task_epoch_settings = {
     'funcloc': {
-        'conditions': ['1'], #this should be the name of the trigger we want to epoch around - see problem in to bids, we will use number 1 = fix
-        'epochs_tmin': -1.0,  # 1 second before the trigger
-        'epochs_tmax': 2.0,   # 2 seconds after the trigger
-        'baseline': (-0.5, 0) # Baseline from -500ms to 0ms
+        'conditions': ['2'], #this should be the name of the trigger we want to epoch around - see problem in to bids, we will use number 5 = stim1
+        'epochs_tmax': 1.0,   # 1 seconds after the trigger
+        'baseline': None
     },
     'cuedstim': {
-        'conditions': ['1'], 
-        'epochs_tmin': -1.0,
-        'epochs_tmax': 2.5,
-        'baseline': (-0.5, 0)
+        'conditions': ['2'], 
+        'epochs_tmin': -0.5,
+        'epochs_tmax': 1.0,
+        'baseline': None
     },
     #this part is running on the rest state data, the postlearnrest should have been created in the to_bids_replay code - number 1 = fix
     'postlearnrest': {              

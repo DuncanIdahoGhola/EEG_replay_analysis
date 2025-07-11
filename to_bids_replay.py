@@ -77,6 +77,7 @@ sub_directories = [Path(sub) for sub in sub_directories]
 meta_frames = []
 meta_frames_func = []
 meta_frames_cued = []
+meta_frames_rest = []
 
 #we will gain access to all behaviour file so that if meta data is needed we have access to it
 sub_meta_dir= [Path(sub) for sub in sub_meta_dir]
@@ -111,39 +112,57 @@ for sub in sub_meta_dir:
         #as of now we only need meta data for the learn prob file to get when the rest state starts 
         learn_prob_file = pd.read_csv(str(learn_prob_file))
         #we need to determine when the rest_instr started and when was the last trigger sent compared to text_4.started
-        rest_instr_timer = learn_prob_file['rest_instr.started'].dropna().iloc[-1]
+        rest_instr_timer = learn_prob_file['rest_instr.stopped'].dropna().iloc[-1]
         last_text_4 = learn_prob_file['text_4.started'].dropna().iloc[-1]
+        end_exp_start = learn_prob_file['end_exp.started'].dropna().iloc[-1]
+        
 
         #create a new data frame with sub, rest_instr_timer and last_text_4
-        meta_data = pd.DataFrame({'sub': [sub.name], 'rest_instr_timer': [rest_instr_timer], 'last_text_4': [last_text_4]})
+        meta_data = pd.DataFrame({'sub': [sub.name], 'rest_instr_timer': [rest_instr_timer], 'last_text_4': [last_text_4], 'end_of_exp': [end_exp_start]})
         #concat meta_data to the meta_frames
         meta_frames.append(meta_data)
 
         #we also need to get the meta data for func loc 
         meta_df_func = pd.read_csv(str(func_loc_file))
-        meta_clean = meta_df_func[['image_file','presented_word', 'is_match','response_correct']]
         #drow rows of meta_clean that have NaN for image_file and re index
-        meta_clean = meta_clean.dropna(subset=['image_file']).reset_index(drop=True)
+
+        meta_df_func_clean = meta_df_func.dropna(subset=['image_file']).reset_index(drop=True)
+
+        #meta_clean = meta_df_func[['image_file','presented_word', 'is_match','response_correct']]
         new_image_file = {
             'stimuli/ciseau.png' : 'ciseau',
             'stimuli/face.png' : 'face',
             'stimuli/banane.png' : 'banane',
             'stimuli/zèbre.png' : 'zèbre',
         }
-        meta_clean['image_file'] = meta_clean['image_file'].replace(new_image_file)
-
+        meta_df_func_clean['image_file'] = meta_df_func_clean['image_file'].replace(new_image_file)
         #add the sub name to meta_clean
-        meta_clean['sub'] = sub.name
+        meta_df_func_clean['sub'] = sub.name
         #append meta_clean to meta_frames_func
-        meta_frames_func.append(meta_clean)
+        meta_frames_func.append(meta_df_func_clean)
 
         #WE could also need meta data from the cued stim files - we could therefore add it just in case
 
         cued_stim_file = pd.read_csv(str(cued_stim_file))
-        cued_clean_stim_file = cued_stim_file[['cue_direction', 'cue_text', 'probe_image_file']]
-        cued_clean_stim_file = cued_clean_stim_file.dropna(subset=['cue_direction']).reset_index(drop=True)
+
+        #cued_clean_stim_file = cued_stim_file[['cue_direction', 'cue_text', 'probe_image_file']]
+        cued_clean_stim_file = cued_stim_file.dropna(subset=['cue_direction']).reset_index(drop=True)
         cued_clean_stim_file['sub'] = sub.name
         meta_frames_cued.append(cued_clean_stim_file)
+
+
+
+        #we will get the meta data from the rest state to crop it to exaclty 300 seconds
+        rest_state_file = pd.read_csv(str(rest_state_file))
+        rest_state_started = rest_state_file['rest_state.started'].dropna().iloc[-1]
+        rest_state_stopped = rest_state_file['rest_state.stopped'].dropna().iloc[-1]
+
+        rest_state_meta = pd.DataFrame({'sub': [sub.name], 'rest_state_started': [rest_state_started], 'rest_state_stopped': [rest_state_stopped]})
+        meta_frames_rest.append(rest_state_meta)
+
+        
+
+
 
 
 
@@ -156,6 +175,8 @@ huge_dataframe = pd.concat(meta_frames, ignore_index=True)
 func_huge = pd.concat(meta_frames_func, ignore_index=True)
 
 cued_huge = pd.concat(meta_frames_cued, ignore_index=True)
+
+rest_huge = pd.concat(meta_frames_rest, ignore_index=True)
 
 
         
@@ -265,30 +286,56 @@ for sub in sub_directories:
         cleaned_annotations = mne.Annotations(onset=new_onsets, duration=new_durations, description=new_descriptions)
         raw.set_annotations(cleaned_annotations)
 
-
     #we should now have cleaned events with ids for each triggers we sent during the experiment :) 
 
     #we need to crop our learn_prob so that only the rest state is left - to do so we must first match our eeg clock to our psychopy clock
     #use the huge dataframe to get the data
     rest_instr_timer = huge_dataframe[huge_dataframe['sub'] == sub.name]['rest_instr_timer'].values[0]
     last_text_4 = huge_dataframe[huge_dataframe['sub'] == sub.name]['last_text_4'].values[0]
-
+    end_of_exp = huge_dataframe[huge_dataframe['sub'] == sub.name]['end_of_exp'].values[0]
     
-
     onsets = raw_learn_prob.annotations.onset
     descriptions = np.array(raw_learn_prob.annotations.description)
-    try:
+    if 'resp' in descriptions:
         resp_onsets = onsets[descriptions == 'resp']
         last_resp_time = resp_onsets[-1]
         clock_diff = last_resp_time - last_text_4
         crop_start = rest_instr_timer - clock_diff
-    except IndexError:
-        crop_start = None
+        crop_end = end_of_exp - clock_diff
+    else:
+        crop_start = rest_instr_timer
+
 
     if crop_start is not None:
-        raw_postlearnrest = raw_learn_prob.copy().crop(tmin=crop_start, tmax=None)
+        raw_postlearnrest = raw_learn_prob.copy().crop(tmin=crop_start, tmax=crop_end)
     else:
         raw_postlearnrest = None
+
+
+
+    #we should also crop our rest state to ensure that it lasts 300seconds
+    rest_state_start = rest_huge[rest_huge['sub'] == sub.name]['rest_state_started'].values[0]
+    rest_state_end = rest_huge[rest_huge['sub'] == sub.name]['rest_state_stopped'].values[0]
+
+    #find onsets to find another cloc diff
+
+    onsets_rest = raw_rest_state.annotations.onset
+    descriptions_rest = np.array(raw_rest_state.annotations.description)
+
+    if 'fix' in descriptions_rest:
+        fix_onsets = onsets_rest[descriptions_rest == 'fix']
+        clock_diff_rest = rest_state_start - fix_onsets[0]
+        crop_start_rest = rest_state_start - clock_diff_rest
+        crop_end_rest = rest_state_end - clock_diff_rest
+    else:
+        crop_start_rest = rest_state_start
+        crop_end_rest = rest_state_end
+
+    if crop_start_rest is not None:
+        raw_rest_state = raw_rest_state.copy().crop(tmin=crop_start_rest, tmax=crop_end_rest)
+    else:
+        raw_rest_state = None
+
 
 
     #we can add meta data of func loc here - we start by opening the huge meta only with the sub name matching sub in this loop
@@ -297,11 +344,9 @@ for sub in sub_directories:
     func_df_sub = func_df_sub.drop(columns=['sub'])
    
     #we need the event meta data to match all events/trigger that we have in our annotations - 5 triggers per run + 1 trigger to start recording
-    #n_repeats  = 5
-    #new_index = np.repeat(func_df_sub.index, n_repeats)
-    #df_expanded_funcloc = func_df_sub.loc[new_index]
-    #df_expanded_funcloc.index = range(1, len(df_expanded_funcloc) + 1)
-    #df_expanded_funcloc = df_expanded_funcloc.reset_index(drop=True)
+    n_repeats  = 5
+    new_index = np.repeat(func_df_sub.index, n_repeats)
+    df_expanded_funcloc = func_df_sub.loc[new_index]
    
    #add 1 row to func_df_sub with a NaN value
     #new_row = {'image_file': np.nan, 'presented_word': np.nan, 'is_match': np.nan, 'response_correct': np.nan}
@@ -311,27 +356,143 @@ for sub in sub_directories:
     #df_expanded_funcloc = pd.concat([new_row_df, df_expanded_funcloc], ignore_index=True)
     #print first 10 rows of this new df
    
-    # 1. Get all cleaned annotations from the raw file.
-    annots_funcloc = raw_func_loc.annotations
-
-    # 2. Find the indices of ONLY the 'fix' events.
-    stim_indices = [i for i, desc in enumerate(annots_funcloc.description) if desc == 'stim1']
-    # 3. Create a new Annotations object containing only the 'fix' events.
-    annots_funcloc_stim_only = annots_funcloc[stim_indices]
-    # Sanity check: ensure the number of trials in your metadata matches the number of 'fix' events
-    assert len(func_df_sub) == len(annots_funcloc_stim_only)
-    # 4. Create a copy of the raw object to avoid modifying the original.
-    raw_func_loc_for_bids = raw_func_loc.copy()
-    raw_func_loc_for_bids.set_annotations(annots_funcloc_stim_only)
-
-
     #we will create a dictionnary to descripe the extra event
     extra_event_descriptions = {
-        'image_file': 'Image shown to participants',
-        'presented_word': 'word presented to participants',
-        'is_match' : 'Did the word and image match',
-        'response_correct' : '1 is good, 0 is bad'
+        # == Core Trial & Condition Information ==
+        'image_file': 'The relative path to the image file presented on this trial.',
+        'presented_word': 'The word stimulus presented on this trial.',
+        'is_match': 'The pre-defined condition of the trial, specifying if the image and word were a "match" or "mismatch".',
+        'corrAns': 'The correct answer key for the trial (e.g., "1" for mismatch, "2" for match).',
+        'blank_duration': 'Planned duration in seconds of the blank screen that appears after the word stimulus.',
+        'iti_duration': 'Planned duration in seconds of the inter-trial interval (ITI) that follows the trial.',
+
+        # == Participant Response Data ==
+        'key_resp.keys': 'The key pressed by the participant to respond to the stimulus.',
+        'key_resp.corr': 'Indicates if the participant\'s response was correct (1) or incorrect (0).',
+        'key_resp.rt': 'Reaction time of the participant\'s response, in seconds, from the start of the response window.',
+        'key_resp.duration': 'Duration in seconds for which the response key was held down.',
+        'finish_time.keys': 'Key pressed by the experimenter to pause or end the experiment prematurely (e.g., "p").',
+        'finish_time.rt': 'Reaction time for the key press to pause or end the experiment.',
+        'finish_time.duration': 'Duration the key was held down to pause or end the experiment.',
+        'instr_resp.keys': 'The key pressed by the participant to advance past the instructions.',
+        'instr_resp.rt': 'Time taken in seconds for the participant to advance past the instructions.',
+        'instr_resp.duration': 'Duration the instruction-advancement key was held down.',
+        'key_resp_3.keys': 'The key pressed to trigger the start of the experiment trials (e.g., scanner trigger or spacebar).',
+        'key_resp_3.rt': 'Time taken in seconds to press the trigger key after the prompt appeared.',
+        'key_resp_3.duration': 'Duration the trigger key was held down.',
+        'key_resp_2.keys': 'The key pressed by the participant to dismiss the final "end of experiment" screen.',
+
+        # == Custom BIDS-related Variables (Likely created during processing) ==
+        'image_presented': 'The relative path to the image file presented in the trial (BIDS-compliant name).',
+        'word_presented': 'The word presented in the trial (BIDS-compliant name).',
+        'is_match_condition': 'The specified condition for the trial: match or mismatch (BIDS-compliant name).',
+        'response_given': 'The key ("1" or "2") pressed by the participant as their response (BIDS-compliant name).',
+        'response_correct': 'A binary indicator of whether the response was correct (1) or incorrect (0) (BIDS-compliant name).',
+        'response_rt': 'The reaction time of the participant\'s response for the trial, in seconds (BIDS-compliant name).',
+
+        # == PsychoPy Loop & Trial Counters ==
+        'thisN': 'The overall trial number within the entire experiment, 0-indexed (PsychoPy variable).',
+        'thisTrialN': 'The trial number within the current loop or block, 0-indexed (PsychoPy variable).',
+        'thisRepN': 'The repetition (block) number of the current loop, 0-indexed (PsychoPy variable).',
+        'inside_loop_trials.thisRepN': 'Repetition number of the main trial loop (PsychoPy internal log).',
+        'inside_loop_trials.thisTrialN': 'Trial number within the current loop repetition (PsychoPy internal log).',
+        'inside_loop_trials.thisN': 'Overall trial number within the main trial loop (PsychoPy internal log).',
+        'inside_loop_trials.thisIndex': 'The 0-indexed number of the trial from the conditions file (PsychoPy internal log).',
+        'inside_loop_trials.key_resp.keys': 'Key pressed, logged internally by the trial loop object.',
+        'inside_loop_trials.key_resp.corr': 'Correctness of response, logged internally by the trial loop object.',
+        'inside_loop_trials.key_resp.rt': 'Reaction time, logged internally by the trial loop object.',
+        'inside_loop_trials.key_resp.duration': 'Key press duration, logged internally by the trial loop object.',
+        'inside_loop_trials.finish_time.keys': 'Experimenter key press to pause/end, logged internally by the trial loop object.',
+        'inside_loop_trials.finish_time.rt': 'Reaction time of experimenter pause/end key, logged internally by the trial loop object.',
+        'inside_loop_trials.finish_time.duration': 'Duration of experimenter pause/end key, logged internally by the trial loop object.',
+
+        # == Timestamps & Durations (System-level) ==
+        'thisRow.t': 'Time elapsed in seconds since the start of the experiment when the current row of data was logged.',
+        'setup_experiment.started': 'Timestamp for the start of the initial experiment setup routine.',
+        'setup_experiment.stopped': 'Timestamp for the end of the initial experiment setup routine.',
+        'instr_text.started': 'Timestamp for the start of the instruction text display.',
+        'instr_resp.started': 'Timestamp for the start of the response period for the instructions.',
+        'start_eeg.started': 'Timestamp for the start of the "waiting for scanner/trigger" routine.',
+        'start_eeg.stopped': 'Timestamp for the end of the "waiting for scanner/trigger" routine.',
+        'text_2.started': 'Timestamp for the onset of the "waiting for trigger" text prompt.',
+        'key_resp_3.started': 'Timestamp for when the program started listening for the trigger key.',
+        'load_images.started': 'Timestamp for the start of the image pre-loading routine (e.g., during a break).',
+        'load_images.stopped': 'Timestamp for the end of the image pre-loading routine.',
+        'text_3.started': 'Timestamp for the onset of the text component shown during a break.',
+        'text_3.stopped': 'Timestamp for the offset of the text component shown during a break.',
+        'preload_current_image_2.started': 'Timestamp for the start of the component responsible for pre-loading images during a break.',
+        'fixation.started': 'Timestamp for the onset of the primary pre-stimulus fixation cross.',
+        'fixation.stopped': 'Timestamp for the offset of the primary pre-stimulus fixation cross.',
+        'fixation_2.started': 'Timestamp for the onset of a secondary fixation cross (e.g., during a break).',
+        'fixation_2.stopped': 'Timestamp for the offset of a secondary fixation cross.',
+        'trials_image.started': 'Timestamp for the start of the routine responsible for showing the image stimulus.',
+        'trials_image.stopped': 'Timestamp for the end of the routine responsible for showing the image stimulus.',
+        'stim_image.started': 'Timestamp for the precise onset of the image stimulus component.',
+        'stim_image.stopped': 'Timestamp for the precise offset of the image stimulus component.',
+        'trials_word.started': 'Timestamp for the start of the routine responsible for showing the word stimulus.',
+        'trials_word.stopped': 'Timestamp for the end of the routine responsible for showing the word stimulus.',
+        'stim_word.started': 'Timestamp for the precise onset of the word stimulus component.',
+        'stim_word.stopped': 'Timestamp for the precise offset of the word stimulus component.',
+        'blank.started': 'Timestamp for the start of the routine containing the post-stimulus blank screen.',
+        'blank.stopped': 'Timestamp for the end of the routine containing the post-stimulus blank screen.',
+        'blank_interval.started': 'Timestamp for the onset of the post-stimulus blank screen component.',
+        'blank_interval.stopped': 'Timestamp for the offset of the post-stimulus blank screen component.',
+        'response.started': 'Timestamp for the start of the routine containing the response window.',
+        'response.stopped': 'Timestamp for the end of the routine containing the response window.',
+        'key_resp.started': 'Timestamp for the start of the response collection window.',
+        'text.started': 'Timestamp for the onset of any text component within the response routine.',
+        'feedback_routine.started': 'Timestamp for the start of the feedback display routine.',
+        'feedback_routine.stopped': 'Timestamp for the end of the feedback display routine.',
+        'iti_routine.started': 'Timestamp for the start of the inter-trial interval (ITI) routine.',
+        'iti_routine.stopped': 'Timestamp for the end of the ITI routine.',
+        'iti_fixation.started': 'Timestamp for the onset of the fixation cross during the ITI.',
+        'iti_fixation.stopped': 'Timestamp for the offset of the fixation cross during the ITI.',
+        'break_2.started': 'Timestamp for the start of a break routine within the experiment.',
+        'break_2.stopped': 'Timestamp for the end of a break routine.',
+        'timer_text.started': 'Timestamp for the onset of the break countdown timer text.',
+        'finish_time.started': 'Timestamp for when the program started listening for a pause/end key press.',
+        'end.started': 'Timestamp for the start of the final "end of experiment" routine.',
+        'end.stopped': 'Timestamp for the end of the final "end of experiment" routine.',
+        'end_text.started': 'Timestamp for the onset of the final "thank you" or "end" text.',
+        'end_text.stopped': 'Timestamp for the offset of the final "thank you" or "end" text.',
+        'key_resp_2.started': 'Timestamp for when the program started listening for a key press to end the experiment.',
+        'key_resp_2.stopped': 'Timestamp for when the participant pressed a key to end the experiment.',
+
+        # == Feedback-related columns ==
+        'feedback_message_to_show': 'The content of the feedback message prepared for display (may not have been shown).',
+        'show_feedback_flag_value': 'A boolean flag indicating if feedback was scheduled to be shown for the trial.',
+
+        # == General Experiment & Session Metadata ==
+        'notes': 'Any manual notes recorded by the experimenter during the session.',
+        'participant': 'The participant identifier.',
+        'session': 'The session number or identifier.',
+        'date': 'The date and time the experiment was run, in YYYY-MM-DD_HHhMM.SS.ms format.',
+        'expName': 'The name of the PsychoPy experiment.',
+        'psychopyVersion': 'The version of PsychoPy used to run the experiment.',
+        'frameRate': 'The measured frame rate of the monitor in Hz during the experiment.',
+        'match_key': 'The specific keyboard key assigned to "match" responses.',
+        'mismatch_key': 'The specific keyboard key assigned to "mismatch" responses.',
+        'allowed_keys_list': 'A list of keyboard keys that were accepted as valid participant responses.',
+        'expStart': 'The start date and time of the experiment session with timezone information.',
+        'event_type' : "which even took place during the experiment",
+        
     }
+    
+    #add even type to the func_loc_meta data
+    import itertools
+
+    labels = ['fix', 'stim1', 'word', 'blank', 'resp']
+    df_expanded_funcloc['event_type'] = list(itertools.islice(
+        itertools.cycle(labels), len(df_expanded_funcloc)))
+        
+    #drop the unadmed:103 column from the data frame 
+    if 'Unnamed: 103' in df_expanded_funcloc.columns:
+        df_expanded_funcloc = df_expanded_funcloc.drop(columns=['Unnamed: 103'])
+    df_expanded_funcloc = df_expanded_funcloc.reset_index(drop=True)
+    #it is important to reset_index so it matches index in the orignal eeg files 
+    #WE should now have all the meta data that we will add to func_loc
+
+
 
 
     #we now can get the meta data from our cued stim
@@ -339,33 +500,131 @@ for sub in sub_directories:
     cued_df_sub = cued_df_sub.drop(columns=['sub'])
 
     #we also need to match the ammounts of triggers do the event descriptions + meta data (4 triggers + 1 start recording)
-    #n_repeats  = 4
-    #new_index = np.repeat(cued_df_sub.index, n_repeats)
-    #expanded_cued_df = cued_df_sub.loc[new_index]
-    #expanded_cued_df.index = range(1, len(expanded_cued_df) + 1)
-    #expanded_cued_df = expanded_cued_df.reset_index(drop=True)
+    n_repeats  = 4
+    new_index = np.repeat(cued_df_sub.index, n_repeats)
+    expanded_cued_df = cued_df_sub.loc[new_index]
+    
 
+    #add the even type to our df - start with the label strategy we used earlier
+    labels = ['word','fix','stim1','resp',]
+    expanded_cued_df['event_type'] = list(itertools.islice(
+        itertools.cycle(labels), len(expanded_cued_df)))
 
-    #add another row of empty nan values
-    #new_row = {'cue_direction': np.nan, 'cue_text': np.nan, 'probe_image_file': np.nan}
-    #new_row_df = pd.DataFrame(new_row, index=[0])
-    #expanded_cued_df = pd.concat([new_row_df, expanded_cued_df], ignore_index=True)
-
-    #repeat what we just did for func loc 
-    annots_cued = raw_cued_stim.annotations
-    fix_indices_cued = [i for i, desc in enumerate(annots_cued.description) if desc == 'fix']
-    annots_cued_fix_only = annots_cued[fix_indices_cued]
-    assert len(cued_df_sub) == len(annots_cued_fix_only)
-    raw_cued_stim_for_bids = raw_cued_stim.copy()
-    raw_cued_stim_for_bids.set_annotations(annots_cued_fix_only)
+    #drop the unnamed:93
+    if 'Unnamed: 93' in expanded_cued_df.columns:
+        expanded_cued_df = expanded_cued_df.drop(columns=['Unnamed: 93'])
+    #reset index 
+    expanded_cued_df = expanded_cued_df.reset_index(drop=True)
+    
 
     #we can add the event dictionnary
     extra_event_descriptions_cued = {
-        'cue_direction':'direction of mental task',
-        'cue_text' : 'text shown to participants',
-        'probe_image_file': 'image shown to participants'
-    }
+    # == Custom Column for BIDS ==
+    'event_type': 'The type of event/trigger from the EEG annotations (e.g., fix, cue, probe).',
 
+    # == Core Trial & Condition Information ==
+    'block': 'The block number for the current trial.',
+    'cue_direction': 'The direction of the cued mental replay task (e.g., "forward", "backward").',
+    'cue_text': 'The text content of the cue presented to the participant (e.g., "1 ->", "<- 4").',
+    'probe_image_file': 'The image file shown as a probe after the mental replay period.',
+    'correct_response': 'The correct key press expected for the probe image ("1" for mismatch, "2" for match).',
+
+    # == Participant Response Data ==
+    'key_resp_probe.keys': 'The key pressed by the participant in response to the probe image.',
+    'key_resp_probe.corr': 'Indicates if the probe response was correct (1) or incorrect (0).',
+    'key_resp_probe.rt': 'Reaction time in seconds for the response to the probe image.',
+    'key_resp_probe.duration': 'Duration in seconds for which the probe response key was held down.',
+    'rating_vividness.response': 'The vividness rating provided by the participant (e.g., on a scale of 1-4).',
+    'rating_vividness.rt': 'Time taken in seconds to provide the vividness rating, measured from the start of the rating scale display.',
+    'key_resp_rating.keys': 'The key used to confirm and submit the vividness rating.',
+    'key_resp_rating.rt': 'Time taken in seconds to confirm the rating after it was selected.',
+    'key_resp_rating.duration': 'Duration the rating confirmation key was held down.',
+    'key_resp_break.keys': 'The key pressed to continue after a block break.',
+    'key_resp_break.rt': 'Time taken in seconds to press the key to continue after a break.',
+    'key_resp_break.duration': 'Duration the continue-after-break key was held down.',
+    'quit_instr.keys': 'The key pressed to exit the initial instruction screen.',
+    'quit_instr.rt': 'Time taken to exit the initial instruction screen.',
+    'quit_instr.duration': 'Duration the instruction exit key was held down.',
+    'exit_eeg_text.keys': 'The key pressed to proceed from the "waiting for trigger" screen.',
+    'exit_eeg_text.rt': 'Time taken to proceed from the "waiting for trigger" screen.',
+    'exit_eeg_text.duration': 'Duration the "waiting for trigger" exit key was held down.',
+    'exit_end.keys': 'The key pressed to finally exit the experiment after the "end" text.',
+    'exit_end.rt': 'Time taken to exit the final screen.',
+    'exit_end.duration': 'Duration the final exit key was held down.',
+
+    # == PsychoPy Loop & Trial Counters ==
+    'thisN': 'The overall trial number within the entire experiment, 0-indexed.',
+    'thisTrialN': 'The trial number within the current loop or block, 0-indexed.',
+    'thisRepN': 'The repetition (block) number of the current loop, 0-indexed.',
+    'trials_loop.thisRepN': 'Repetition number of the main trial loop (PsychoPy internal log).',
+    'trials_loop.thisTrialN': 'Trial number within the current loop repetition (PsychoPy internal log).',
+    'trials_loop.thisN': 'Overall trial number within the main trial loop (PsychoPy internal log).',
+    'trials_loop.thisIndex': 'The 0-indexed number of the trial from the conditions file (PsychoPy internal log).',
+    'trials_loop.key_resp_probe.keys': 'Key pressed for the probe, logged internally by the trial loop.',
+    'trials_loop.key_resp_probe.corr': 'Correctness of probe response, logged internally by the trial loop.',
+    'trials_loop.key_resp_probe.rt': 'Reaction time for the probe, logged internally by the trial loop.',
+    'trials_loop.key_resp_probe.duration': 'Key press duration for the probe, logged internally by the trial loop.',
+    'trials_loop.rating_vividness.response': 'Vividness rating response, logged internally by the trial loop.',
+    'trials_loop.rating_vividness.rt': 'Vividness rating reaction time, logged internally by the trial loop.',
+    'trials_loop.key_resp_rating.keys': 'Key press for rating confirmation, logged internally by the trial loop.',
+    'trials_loop.key_resp_rating.rt': 'Reaction time for rating confirmation, logged internally by the trial loop.',
+    'trials_loop.key_resp_rating.duration': 'Key press duration for rating confirmation, logged internally by the trial loop.',
+    'trials_loop.key_resp_break.keys': 'Key press to end break, logged internally by the trial loop.',
+    'trials_loop.key_resp_break.rt': 'Reaction time to end break, logged internally by the trial loop.',
+    'trials_loop.key_resp_break.duration': 'Key press duration to end break, logged internally by the trial loop.',
+
+    # == Timestamps & Durations (System-level) ==
+    'thisRow.t': 'Time elapsed in seconds since the start of the experiment when this data row was logged.',
+    'instr_task.started': 'Timestamp for the start of the main instruction routine.',
+    'instr_task.stopped': 'Timestamp for the end of the main instruction routine.',
+    'task_instr_text.started': 'Timestamp for the onset of the task instruction text component.',
+    'quit_instr.started': 'Timestamp for when the program started listening for a key to exit instructions.',
+    'start_eeg.started': 'Timestamp for the start of the "waiting for EEG/scanner trigger" routine.',
+    'start_eeg.stopped': 'Timestamp for the end of the "waiting for EEG/scanner trigger" routine.',
+    'EEG_start_text.started': 'Timestamp for the onset of the "starting EEG" text prompt.',
+    'exit_eeg_text.started': 'Timestamp for when the program started listening for a key to exit the trigger wait screen.',
+    'image_load.started': 'Timestamp for the start of the image pre-loading routine.',
+    'image_load.stopped': 'Timestamp for the end of the image pre-loading routine.',
+    'image_load_text.started': 'Timestamp for the onset of the "loading images" text.',
+    'imag_loader.started': 'Timestamp for the start of the specific image loader component.',
+    'trial.started': 'Timestamp for the start of a single trial routine.',
+    'trial.stopped': 'Timestamp for the end of a single trial routine.',
+    'cue_stim.started': 'Timestamp for the onset of the cue stimulus (text).',
+    'cue_stim.stopped': 'Timestamp for the offset of the cue stimulus (text).',
+    'fixation_stim.started': 'Timestamp for the onset of the fixation cross during the mental replay period.',
+    'fixation_stim.stopped': 'Timestamp for the offset of the fixation cross.',
+    'probe_image.started': 'Timestamp for the onset of the probe image.',
+    'probe_image.stopped': 'Timestamp for the offset of the probe image.',
+    'key_resp_probe.started': 'Timestamp for when the program started listening for a probe response.',
+    'resp_instr.started': 'Timestamp for the onset of the response instruction text.',
+    'rating.started': 'Timestamp for the start of the rating routine.',
+    'rating.stopped': 'Timestamp for the end of the rating routine.',
+    'rating_vividness.started': 'Timestamp for the onset of the vividness rating scale component.',
+    'text_rating_question.started': 'Timestamp for the onset of the rating question text.',
+    'key_resp_rating.started': 'Timestamp for when the program started listening for the rating confirmation key.',
+    'block_break.started': 'Timestamp for the start of a block break routine.',
+    'block_break.stopped': 'Timestamp for the end of a block break routine.',
+    'block_break_text.started': 'Timestamp for the onset of the break text.',
+    'block_break_text.stopped': 'Timestamp for the offset of the break text.',
+    'key_resp_break.started': 'Timestamp for when the program started listening for a key to end the break.',
+    'end_task.started': 'Timestamp for the start of the final "end of task" routine.',
+    'end_task.stopped': 'Timestamp for the end of the final "end of task" routine.',
+    'end_text.started': 'Timestamp for the onset of the final "end" text.',
+    'exit_end.started': 'Timestamp for when the program started listening for the final exit key.',
+    
+    # == General Experiment & Session Metadata ==
+    'notes': 'Any manual notes recorded by the experimenter during the session.',
+    'participant': 'The participant identifier.',
+    'session': 'The session number or identifier.',
+    'date': 'The date and time the experiment was run.',
+    'expName': 'The name of the PsychoPy experiment.',
+    'psychopyVersion': 'The version of PsychoPy used to run the experiment.',
+    'frameRate': 'The measured frame rate of the monitor in Hz.',
+    'sequence_good_key': 'The key assigned to indicate the probe image matched the cued sequence.',
+    'sequence_bad_key': 'The key assigned to indicate the probe image did not match the cued sequence.',
+    'allowed_keys_list': 'A list of keyboard keys accepted as valid participant responses.',
+    'expStart': 'The start date and time of the experiment session with timezone information.'
+    }
 
 
 
@@ -410,8 +669,8 @@ for sub in sub_directories:
     raw_learn_prob.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
     raw_func_loc.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
     raw_cued_stim.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
-    raw_cued_stim_for_bids.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
-    raw_func_loc_for_bids.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
+    #raw_cued_stim_for_bids.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
+    #raw_func_loc_for_bids.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
     if raw_postlearnrest is not None:
         raw_postlearnrest.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
 
@@ -434,20 +693,29 @@ for sub in sub_directories:
 
     #meta data bids
     write_raw_bids(
-        raw=raw_func_loc_for_bids,
+        raw=raw_func_loc,
         bids_path=bids_path_func_loc,
-        event_metadata=func_df_sub,
+        event_metadata=df_expanded_funcloc,
         extra_columns_descriptions=extra_event_descriptions,
+        event_id=event_id_1,
         overwrite=True,
         allow_preload=True,
         format='BrainVision'
     )
 
+    event_id_cued = {
+    'word': 1,
+    'fix': 2,
+    'stim1': 3,
+    'resp': 4
+    }
+
     write_raw_bids(
-        raw=raw_cued_stim_for_bids,
+        raw=raw_cued_stim,
         bids_path=bids_path_cued_stim,
-        event_metadata=cued_df_sub,
+        event_metadata=expanded_cued_df,
         extra_columns_descriptions=extra_event_descriptions_cued,
+        event_id=event_id_cued,
         overwrite=True,
         allow_preload=True,
         format='BrainVision'
