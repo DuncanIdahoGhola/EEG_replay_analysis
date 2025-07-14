@@ -16,19 +16,7 @@ from sklearn.model_selection import cross_val_predict
 import joblib
 import seaborn as sns
 from mne.decoding import Vectorizer, SlidingEstimator, cross_val_multiscore
-
-#DO NOT FORGET TO ADD BASELINE CORRECTION TO EPOCHS - IT HAS BEEN REMOVED FROM THE CONFIG FILE
-
-
-
-
-
-
-
-
-
-
-
+from scipy import stats 
 
 
 
@@ -81,7 +69,9 @@ for sub in sub :
     print(epochs_func_loc.metadata)
     print(epochs_func_loc.metadata.columns)
 
-
+    #######################################
+    # META DATA REATTACHMENT AND CLEANING #
+    #######################################
     #we will start by reattaching meta data to the func loc and cued stim - the pipeline drops the meta data only keeping events
     #Lets first find the tsv files for both funcloc and cued stim
     sub_fodler = os.path.join(bids_root, sub, 'eeg')
@@ -94,11 +84,28 @@ for sub in sub :
     #read the meta data as csv - into dataframe 
     meta_data_func_loc = pd.read_csv(matching_meta_funcloc[0], sep='\t')
     meta_data_cue_stim = pd.read_csv(matching_meta_cuedstim[0], sep='\t')
-    ################################
-    #FUNCLOC ANALYSIS START        #
-    ################################
+    
+    #only keep meta data rows with event_type == 'stime1' for func loc
+    meta_data_func_loc = meta_data_func_loc[meta_data_func_loc['event_type'] == 'stim1']
+
+    #clean the meta data to keep the classifier only the relevant columns
+    #we will keep the image_file, the event_type, presented_word, is_match, columns
+    meta_data_func_loc = meta_data_func_loc[['image_file', 'event_type', 'presented_word', 'is_match']]
+    #reset index
+    meta_data_func_loc = meta_data_func_loc.reset_index(drop=True)
+
+
+    #only keep meta data rows with event_type == 'fix' for cued stim
+    meta_data_cue_stim = meta_data_cue_stim[meta_data_cue_stim['event_type'] == 'fix']
+    #clean meta data, keep cue_direction, cue_text, probe_image_file,
+    meta_data_cue_stim = meta_data_cue_stim[['cue_direction', 'cue_text', 'probe_image_file']]
+    #reset index
+    meta_data_cue_stim = meta_data_cue_stim.reset_index(drop=True)
+    #we can now reattach the meta data to the epochs
     #Start by loading the cleand epochs without meta data
     epochs_func_loc = mne.read_epochs(matching_files_funcloc[0], preload=True)
+    #We also need to add baseline correction to the epochs
+    epochs_func_loc.apply_baseline(baseline=(-0.5, 0))
     #we can find what epochs were kept after ICA using .selection
     selection_indices = epochs_func_loc.selection
     #we can then clean our meta data using this selection_indices
@@ -109,12 +116,32 @@ for sub in sub :
     #CUEDSTIM
     #We will load the meta data, clean it and then append it to the cued_stim_epochs
     epochs_cued_stim = mne.read_epochs(matching_files_cuedstim[0], preload=True)
+    #We also need to add baseline correction to the epochs
+    epochs_cued_stim.apply_baseline(baseline=(-0.5, 0))
+
     selection_indices = epochs_cued_stim.selection
     cleand_metadata_cue = meta_data_cue_stim.iloc[selection_indices]
     cleand_metadata_cue = cleand_metadata_cue.reset_index(drop=True)
     epochs_cued_stim.metadata = cleand_metadata_cue
-
     #Our meta data is now cleaned and fixed to our epochs for both func loc and cued_stim
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ########################################
+    # MACHINE LEARNING ON FUNCTIONAL LOCALIZER DATA #
+    ########################################
+
 
     #MACHINE LEARNING TIME - :) 
     #We want to train a classifier on the functional localizer data
@@ -275,11 +302,185 @@ for sub in sub :
     plt.tight_layout() 
     plt.show()
 
-
-
     ########################################
     # END OF FUNCTIONAL LOCALIZER ANALYSIS #
     ########################################
+
+
+    ########################################
+    # Start of TDLM analysis               #
+    ########################################
+
+    #Do to TDLM we start by loading our peak time model on the func_loc data
+    peak_model_path = os.path.join(models_dir, f'{sub}_peak_time_{int(peak_time*1000)}ms_classifier.joblib')
+    tdlm_classifier = joblib.load(peak_model_path)
+    # The class labels are in the same order as in the classifier - we get our four class labels
+    # These are the images shown to the participant during the functional localizer
+    class_labels = tdlm_classifier[-1].classes_
+
+    #We need to generate continous evidence from the postlearn rest state data
+    epochs_learn_prob = mne.read_epochs(matching_files_learnprob[0], preload=True)
+    #need to transform epochs into continous data
+    # Manually get data and reshape to a continuous array
+    data = epochs_learn_prob.get_data() # Shape is (n_epochs, n_channels, n_times)
+    data_continuous = data.transpose(1, 0, 2).reshape(data.shape[1], -1) # Shape is (n_channels, n_samples)
+
+    # Create a new Raw object from the continuous data and the original info
+    raw_learn_prob = mne.io.RawArray(data_continuous, epochs_learn_prob.info)
+    #we now have our raw data in a continuous format
+    #we can now apply our classifier to the data and check for replay
+
+    # Get the data and prepare it for the classifier
+    X_rest_raw, _ = raw_learn_prob.get_data(picks='eeg', return_times=True)
+    X_rest_reshaped = X_rest_raw.T # Shape becomes (n_times, n_channels)
+
+    # Predict the probability for each class at every single time point
+    rest_evidence_traces = tdlm_classifier.predict_proba(X_rest_reshaped)
+
+    # Store these traces in a pandas DataFrame for easy access
+    evidence_df = pd.DataFrame(rest_evidence_traces, columns=class_labels, index=raw_learn_prob.times)
+
+    #Define replay sequence (important that this step is done for each subject)
+    #find behaviour data from the subject
+    pattern = os.path.join(behaviour_root, sub, 'learn_prob', f'{sub}_learn_probe*.csv')
+    files = glob(pattern)
+    assert len(files) == 1
+    #read the behaviour data
+    behaviour_pd = pd.read_csv(files[0])
+    behaviour_pd = behaviour_pd[['pair_name', 'stim1_img', 'stim2_img']]
+    behaviour_pd = behaviour_pd.dropna()
+    #find the first two rows with pair_name == A_B and C_D
+    subset = behaviour_pd[behaviour_pd['pair_name'].isin(['A_B', 'C_D'])]
+    first_rows = subset.sort_index().groupby('pair_name').head(1)
+    ab_row = first_rows[first_rows['pair_name'] == 'A_B'].iloc[0]
+    cd_row = first_rows[first_rows['pair_name'] == 'C_D'].iloc[0]
+    ab_stim1, ab_stim2 = ab_row[['stim1_img', 'stim2_img']]
+    cd_stim1, cd_stim2 = cd_row[['stim1_img', 'stim2_img']]
+    # DEFINE THE REPLAY SEQUENCE
+    original_sequence  = [ab_stim1, ab_stim2, cd_stim1, cd_stim2]
+    #create dictionnary to rename the sequence
+    new_image_file = {
+            'stimuli/ciseau.png' : 'ciseau',
+            'stimuli/face.png' : 'face',
+            'stimuli/banane.png' : 'banane',
+            'stimuli/zèbre.png' : 'zèbre',
+    }
+    #apply dictionary to rename the sequence
+    replay_sequence = [new_image_file[img] for img in original_sequence]
+
+    # Define the time lags to test 
+    sfreq = raw_learn_prob.info['sfreq']
+    min_lag_ms, max_lag_ms, step_ms = -100, 250, 10
+    lags_ms = np.arange(min_lag_ms, max_lag_ms + step_ms, step_ms)
+    lags_samples = (lags_ms / 1000 * sfreq).astype(int)
+    
+    tdlm_results = {}
+
+    #time to TDLM
+    for i in range(len(replay_sequence) - 1):
+        seed_item = replay_sequence[i]
+        target_item = replay_sequence[i+1]
+        transition_name = f"{seed_item.replace('.png','')} -> {target_item.replace('.png','')}"
+        
+        
+        seed_trace = evidence_df[seed_item].values
+        target_trace = evidence_df[target_item].values
+        
+        betas = []
+        for lag in lags_samples:
+            max_abs_lag = np.abs(lags_samples).max()
+            Y = target_trace[max_abs_lag : -max_abs_lag]
+            start_idx = max_abs_lag - lag
+            end_idx = -max_abs_lag - lag
+            X = seed_trace[start_idx : end_idx]
+            
+            slope, intercept, r_value, p_value, std_err = stats.linregress(X, Y)
+            betas.append(slope)
+        
+        tdlm_results[transition_name] = betas
+
+    #visualise the results
+
+    plt.figure(figsize=(12, 7))
+    
+    for transition_name, betas in tdlm_results.items():
+        plt.plot(lags_ms, betas, label=transition_name, lw=2)
+        
+    plt.axhline(0, color='black', linestyle=':', lw=1, label='No Relationship (Beta=0)')
+    plt.axvline(0, color='black', linestyle='--', lw=1.5, label='Simultaneous Evidence (Lag=0)')
+    
+    plt.title(f'{sub} - TDLM Replay Analysis (Post-Learning Rest)')
+    plt.xlabel('Time Lag (ms) [Target - Seed]')
+    plt.ylabel('Beta Coefficient (Predictive Strength)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     ########################################

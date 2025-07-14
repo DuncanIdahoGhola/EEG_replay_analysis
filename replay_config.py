@@ -41,7 +41,7 @@
 
 #python -m coll_lab_eeg_pipeline -r e:\EEG_analysis_replay\replay_config.py
 
-
+#E:\EEG_analysis_replay
 ########################################################
 # This is a custom config file for the labmp EEG pipeline.
 ###########################################################
@@ -221,6 +221,7 @@ raw_resample_sfreq = 500
 task_epoch_settings = {
     'funcloc': {
         'conditions': ['2'], #this should be the name of the trigger we want to epoch around - see problem in to bids, we will use number 5 = stim1
+        'epochs_tmin': -0.5,  # 0.5 seconds before the trigger
         'epochs_tmax': 1.0,   # 1 seconds after the trigger
         'baseline': None
     },

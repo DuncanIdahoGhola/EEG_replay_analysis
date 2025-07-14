@@ -308,6 +308,8 @@ for sub in sub_directories:
 
     if crop_start is not None:
         raw_postlearnrest = raw_learn_prob.copy().crop(tmin=crop_start, tmax=crop_end)
+        #we also need to remove anotations that are not relevant to the rest state
+        raw_postlearnrest.set_annotations(None)
     else:
         raw_postlearnrest = None
 
@@ -333,10 +335,12 @@ for sub in sub_directories:
 
     if crop_start_rest is not None:
         raw_rest_state = raw_rest_state.copy().crop(tmin=crop_start_rest, tmax=crop_end_rest)
+        #we need to remove annotations that are not relevant to the rest state
+        raw_rest_state.set_annotations(None)
     else:
         raw_rest_state = None
 
-
+    
 
     #we can add meta data of func loc here - we start by opening the huge meta only with the sub name matching sub in this loop
     func_df_sub = func_huge[func_huge['sub'] == sub.name].reset_index(drop=True)
@@ -493,7 +497,40 @@ for sub in sub_directories:
     #WE should now have all the meta data that we will add to func_loc
 
 
+    ############################################################################
+    # These lines are optional, they were used to check if all stims were aligned 
+    #############################################################################
+    #change check_up to true if you want to check for alignment
+    check_up_neccessary = False
+    if check_up_neccessary == True :
+        check_up = func_df_sub['stim_image.started']
+        stim = np.array(raw_func_loc.annotations.description) == 'stim1'
+        stim_onsets = raw_func_loc.annotations.onset[stim]
+        stim_seconds = stim_onsets.tolist()
 
+        check_up_2 = func_df_sub['fixation_2.started']
+        fix = np.array(raw_func_loc.annotations.description) == 'fix'
+        fix_onsets = raw_func_loc.annotations.onset[fix]
+        fix_seconds = fix_onsets.tolist()
+
+
+        diff_seconds_fix = check_up_2 - fix_seconds
+        diff_seconds_stim = check_up - stim_seconds 
+
+        check_up_2 = check_up_2 - diff_seconds_fix
+        check_up = check_up - diff_seconds_stim
+        #add all these variables to 1 big data frame
+        new_df = pd.DataFrame({
+            'fix_psychopy' : check_up_2,
+            'fix_eeg': fix_seconds,
+            'stim_eeg': stim_seconds,
+            'stim_psychopy' : check_up,
+        })
+        if not np.allclose(new_df['fix_psychopy'], new_df['fix_eeg']):
+            print(f"Fixation times do not match for {sub.name}!")
+        else : 
+            print(f"Fixation times match for {sub.name}!")
+        
 
     #we now can get the meta data from our cued stim
     cued_df_sub = cued_huge[cued_huge['sub'] == sub.name].reset_index(drop=True)
@@ -675,9 +712,15 @@ for sub in sub_directories:
         raw_postlearnrest.set_channel_types({'HEOG': 'eog', 'VEOG': 'eog', 'ECG': 'ecg'})
 
     # write raw files to BIDS format for files without meta data
+
+
+    #we will also pass an empty dictionnary for the raw_rest_state so that no events are kept
+
+    rest_state_dic = {}
     write_raw_bids(
         raw_rest_state,
         bids_path_rest_state,
+        event_id=rest_state_dic,
         overwrite=True,
         allow_preload=True,
         format='BrainVision'
@@ -744,6 +787,3 @@ participants_df.to_csv(bids_output / 'participants.tsv', sep='\t', index=False)
 
 
 
-#for some reason adding meta data has messed up the event naming scheme
-#we will use numbers in our config because I do not understand how to fix it and it should work with the numbers instead of keywords like fix
-#This is not ideal and we can look for a solution - if a solution is found we should apply + rename to fix the epochs 
