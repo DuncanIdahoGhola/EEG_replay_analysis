@@ -204,7 +204,8 @@ l_freq = 1.0
 
 #here we have our low pass filter that should remove high-frequency noise 
 h_freq = 40
-
+# This ensures data used for ICA is filtered between 1-100 Hz as recommended by ICLabel
+ica_h_freq = 100.0
 #we can and also should always resample our data - we will do this at 500hz 
 raw_resample_sfreq = 500
 
@@ -273,7 +274,7 @@ spatial_filter = "ica"
 
 #ICA needs an algorithm we will use picard 
 
-ica_algorithm = "picard"
+ica_algorithm = "picard-extended_infomax"
 
 #A high-pass filter applied just for the ICA calculation to improve its performance.
 ica_l_freq = 1.0

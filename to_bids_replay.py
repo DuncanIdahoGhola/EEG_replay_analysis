@@ -419,6 +419,7 @@ for sub in sub_directories:
         'start_eeg.started': 'Timestamp for the start of the "waiting for scanner/trigger" routine.',
         'start_eeg.stopped': 'Timestamp for the end of the "waiting for scanner/trigger" routine.',
         'text_2.started': 'Timestamp for the onset of the "waiting for trigger" text prompt.',
+        'text_2.stopped': 'Timestamp for the offset of the "waiting for trigger" text prompt.',
         'key_resp_3.started': 'Timestamp for when the program started listening for the trigger key.',
         'load_images.started': 'Timestamp for the start of the image pre-loading routine (e.g., during a break).',
         'load_images.stopped': 'Timestamp for the end of the image pre-loading routine.',
@@ -461,6 +462,8 @@ for sub in sub_directories:
         'end_text.stopped': 'Timestamp for the offset of the final "thank you" or "end" text.',
         'key_resp_2.started': 'Timestamp for when the program started listening for a key press to end the experiment.',
         'key_resp_2.stopped': 'Timestamp for when the participant pressed a key to end the experiment.',
+        'feedback_text_display.started': 'Timestamp for the onset of the feedback message display.',
+        'feedback_text_display.stopped': 'Timestamp for the offset of the feedback message display.',
 
         # == Feedback-related columns ==
         'feedback_message_to_show': 'The content of the feedback message prepared for display (may not have been shown).',
@@ -493,6 +496,13 @@ for sub in sub_directories:
     if 'Unnamed: 103' in df_expanded_funcloc.columns:
         df_expanded_funcloc = df_expanded_funcloc.drop(columns=['Unnamed: 103'])
     df_expanded_funcloc = df_expanded_funcloc.reset_index(drop=True)
+
+    #drop the unnamed:106 column from the data frame
+    if 'Unnamed: 106' in df_expanded_funcloc.columns:
+        df_expanded_funcloc = df_expanded_funcloc.drop(columns=['Unnamed: 106'])
+    #reset index so it matches index in the orignal eeg files
+    df_expanded_funcloc = df_expanded_funcloc.reset_index(drop=True)
+
     #it is important to reset_index so it matches index in the orignal eeg files 
     #WE should now have all the meta data that we will add to func_loc
 
@@ -648,7 +658,8 @@ for sub in sub_directories:
     'end_task.stopped': 'Timestamp for the end of the final "end of task" routine.',
     'end_text.started': 'Timestamp for the onset of the final "end" text.',
     'exit_end.started': 'Timestamp for when the program started listening for the final exit key.',
-    
+    'image_load_text.stopped': 'Timestamp for the offset of the "loading images" text.',
+
     # == General Experiment & Session Metadata ==
     'notes': 'Any manual notes recorded by the experimenter during the session.',
     'participant': 'The participant identifier.',
@@ -785,5 +796,5 @@ participants_df = pd.DataFrame(all_participants_data)
 participants_df = participants_df.drop_duplicates()
 participants_df.to_csv(bids_output / 'participants.tsv', sep='\t', index=False)
 
-
+print(f"Processed {len(already_bids)} subjects and saved BIDS files to {bids_output}.")
 

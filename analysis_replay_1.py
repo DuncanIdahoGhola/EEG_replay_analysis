@@ -17,13 +17,15 @@ import joblib
 import seaborn as sns
 from mne.decoding import Vectorizer, SlidingEstimator, cross_val_multiscore
 from scipy import stats 
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import confusion_matrix
 
 
 
 #create a sub list
 
-sub = ['sub-027']
-
+sub = ['sub-027', 'sub-099']
+sub_permutation_done= ['sub-027'] #this list is used to check if the permutation test has been done for the subject
 
 #to start analysing data we first need to get all paths to the fif data that came out of our pipeline
 root = os.getcwd()
@@ -33,7 +35,7 @@ func_loc_eeg = os.path.join(bids_der, 'task_funcloc', 'preprocessed')
 learn_prob_eeg = os.path.join(bids_der, 'task_postlearnrest', 'preprocessed')
 rest_state_eeg = os.path.join(bids_der, 'task_reststate', 'preprocessed')
 bids_root = os.path.join(root, 'bids_output')
-
+deriv_root = os.path.join(root, 'analyse_deriv')
 
 #we will need to have access our meta data files so that we can train our classifier
 behaviour_root = os.path.join(root, 'behaviour_data')
@@ -59,6 +61,10 @@ for sub in sub :
     pattern = f'{sub}_task-reststate_proc-clean_epo.fif'
     matching_files_reststate = glob(os.path.join(reststate_folder, pattern))
     assert len(matching_files_reststate) == 1
+
+    #create a sub folder in the deriv root
+    sub_folder = os.path.join(deriv_root, sub)
+    os.makedirs(sub_folder, exist_ok=True)
 
 
     #this is an example on how to plot epochs and psd
@@ -181,8 +187,10 @@ for sub in sub :
     plt.ylabel('Accuracy')
     plt.ylim([0, 1])
     plt.legend()
+    #save this plot in sub folder
+    plot_path = os.path.join(sub_folder, f'{sub}_whole_epoch_decoding_accuracy.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.show()
-
 
     #time resolved decoding 
     # Define the classifier pipeline (no Vectorizer needed here, as SlidingEstimator handles the time dimension)
@@ -218,8 +226,10 @@ for sub in sub :
     plt.ylabel('Classifier Accuracy')
     plt.legend(loc='upper left')
     plt.grid(True, linestyle=':')
+    #save this plot in sub folder
+    plot_path = os.path.join(sub_folder, f'{sub}_time_resolved_decoding_accuracy.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.show()
-
 
     #So far we have trained a classifier on the functional localizer data and predicted the image shown to the participant
     #We have done so on parts of the data to look at accuracy and time resolved decoding
@@ -300,206 +310,392 @@ for sub in sub :
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left') 
     plt.grid(True, linestyle=':')
     plt.tight_layout() 
+    #save this plot in sub folder
+    plot_path = os.path.join(sub_folder, f'{sub}_time_course_predicted_probability.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')    
     plt.show()
 
     ########################################
     # END OF FUNCTIONAL LOCALIZER ANALYSIS #
     ########################################
 
+    ########################################
+    # find replay sequence in the data     #
+    ########################################
+
+    # 1. Load the participant's behavioral data from the learning phase
+    pattern = os.path.join(behaviour_root, sub, 'learn_prob', f'{sub}_learn_probe*.csv')
+    files = glob(pattern)
+    assert len(files) == 1, f"Expected 1 behaviour file, found {len(files)} for {sub}"
+    behaviour_pd = pd.read_csv(files[0])
+    
+    # 2. Get all unique learning pairs (stim1 -> stim2)
+    # The 'pair_name' column tells us which pairs were part of the sequence learning
+    learning_pairs_df = behaviour_pd[behaviour_pd['pair_name'].isin(['A_B', 'B_C', 'C_D'])]
+    unique_pairs = learning_pairs_df[['stim1_img', 'stim2_img']].drop_duplicates().reset_index(drop=True)
+    assert len(unique_pairs) == 3, f"Expected 3 unique learning pairs, found {len(unique_pairs)} for {sub}"
+
+    # 3. Create a transition map (a dictionary: {start_item: end_item})
+    transitions = dict(zip(unique_pairs['stim1_img'], unique_pairs['stim2_img']))
+    
+    # 4. Find the true starting item of the sequence
+    # The start item is the one that is a 'stim1_img' but never a 'stim2_img'
+    all_starts = set(unique_pairs['stim1_img'])
+    all_ends = set(unique_pairs['stim2_img'])
+    start_node_set = all_starts - all_ends
+    assert len(start_node_set) == 1, "Failed to find a unique start node for the sequence"
+    start_node = start_node_set.pop()
+
+    # 5. Walk the chain to reconstruct the full sequence
+    reconstructed_sequence = [start_node]
+    current_node = start_node
+    while current_node in transitions:
+        current_node = transitions[current_node]
+        reconstructed_sequence.append(current_node)
+    
+    assert len(reconstructed_sequence) == 4, "Failed to reconstruct a 4-item sequence"
+    
+    # 6. Apply the final renaming to match the classifier's labels (with .png)
+    new_image_file_map = {
+        'stimuli/ciseau.png' : 'ciseau',
+        'stimuli/face.png' : 'face',
+        'stimuli/banane.png' : 'banane',
+        'stimuli/zèbre.png' : 'zèbre',
+    }
+    replay_sequence = [new_image_file_map[item] for item in reconstructed_sequence]
+
+
+    # Step A: Load the trained classifier
+    peak_model_path = os.path.join(models_dir, f'{sub}_peak_time_{int(peak_time*1000)}ms_classifier.joblib')
+    tdlm_classifier = joblib.load(peak_model_path)
+    class_labels = tdlm_classifier[-1].classes_
+
+    # Step B: Generate evidence trace for POST-learning rest
+    epochs_learn_prob = mne.read_epochs(matching_files_learnprob[0], preload=True)
+    data = epochs_learn_prob.get_data()
+    data_continuous = data.transpose(1, 0, 2).reshape(data.shape[1], -1)
+    raw_learn_prob = mne.io.RawArray(data_continuous, epochs_learn_prob.info)
+    X_post_rest_reshaped = raw_learn_prob.get_data(picks='eeg').T
+    post_rest_evidence_traces = tdlm_classifier.predict_proba(X_post_rest_reshaped)
+    evidence_df = pd.DataFrame(post_rest_evidence_traces, columns=class_labels, index=raw_learn_prob.times)
+
+    # Step C: Generate evidence trace for PRE-learning rest (Sanity Check)
+    epochs_rest = mne.read_epochs(matching_files_reststate[0], preload=True)
+    data_rest = epochs_rest.get_data()
+    data_continuous_rest = data_rest.transpose(1, 0, 2).reshape(data_rest.shape[1], -1)
+    raw_rest = mne.io.RawArray(data_continuous_rest, epochs_rest.info)
+    X_pre_rest_reshaped = raw_rest.get_data(picks='eeg').T
+    pre_rest_evidence_traces = tdlm_classifier.predict_proba(X_pre_rest_reshaped)
+    evidence_df_rest = pd.DataFrame(pre_rest_evidence_traces, columns=class_labels, index=raw_rest.times)
 
     ########################################
     # Start of TDLM analysis               #
     ########################################
 
-    #Do to TDLM we start by loading our peak time model on the func_loc data
-    peak_model_path = os.path.join(models_dir, f'{sub}_peak_time_{int(peak_time*1000)}ms_classifier.joblib')
-    tdlm_classifier = joblib.load(peak_model_path)
-    # The class labels are in the same order as in the classifier - we get our four class labels
-    # These are the images shown to the participant during the functional localizer
-    class_labels = tdlm_classifier[-1].classes_
-
-    #We need to generate continous evidence from the postlearn rest state data
-    epochs_learn_prob = mne.read_epochs(matching_files_learnprob[0], preload=True)
-    #need to transform epochs into continous data
-    # Manually get data and reshape to a continuous array
-    data = epochs_learn_prob.get_data() # Shape is (n_epochs, n_channels, n_times)
-    data_continuous = data.transpose(1, 0, 2).reshape(data.shape[1], -1) # Shape is (n_channels, n_samples)
-
-    # Create a new Raw object from the continuous data and the original info
-    raw_learn_prob = mne.io.RawArray(data_continuous, epochs_learn_prob.info)
-    #we now have our raw data in a continuous format
-    #we can now apply our classifier to the data and check for replay
-
-    # Get the data and prepare it for the classifier
-    X_rest_raw, _ = raw_learn_prob.get_data(picks='eeg', return_times=True)
-    X_rest_reshaped = X_rest_raw.T # Shape becomes (n_times, n_channels)
-
-    # Predict the probability for each class at every single time point
-    rest_evidence_traces = tdlm_classifier.predict_proba(X_rest_reshaped)
-
-    # Store these traces in a pandas DataFrame for easy access
-    evidence_df = pd.DataFrame(rest_evidence_traces, columns=class_labels, index=raw_learn_prob.times)
-
-    #Define replay sequence (important that this step is done for each subject)
-    #find behaviour data from the subject
-    pattern = os.path.join(behaviour_root, sub, 'learn_prob', f'{sub}_learn_probe*.csv')
-    files = glob(pattern)
-    assert len(files) == 1
-    #read the behaviour data
-    behaviour_pd = pd.read_csv(files[0])
-    behaviour_pd = behaviour_pd[['pair_name', 'stim1_img', 'stim2_img']]
-    behaviour_pd = behaviour_pd.dropna()
-    #find the first two rows with pair_name == A_B and C_D
-    subset = behaviour_pd[behaviour_pd['pair_name'].isin(['A_B', 'C_D'])]
-    first_rows = subset.sort_index().groupby('pair_name').head(1)
-    ab_row = first_rows[first_rows['pair_name'] == 'A_B'].iloc[0]
-    cd_row = first_rows[first_rows['pair_name'] == 'C_D'].iloc[0]
-    ab_stim1, ab_stim2 = ab_row[['stim1_img', 'stim2_img']]
-    cd_stim1, cd_stim2 = cd_row[['stim1_img', 'stim2_img']]
-    # DEFINE THE REPLAY SEQUENCE
-    original_sequence  = [ab_stim1, ab_stim2, cd_stim1, cd_stim2]
-    #create dictionnary to rename the sequence
-    new_image_file = {
-            'stimuli/ciseau.png' : 'ciseau',
-            'stimuli/face.png' : 'face',
-            'stimuli/banane.png' : 'banane',
-            'stimuli/zèbre.png' : 'zèbre',
-    }
-    #apply dictionary to rename the sequence
-    replay_sequence = [new_image_file[img] for img in original_sequence]
-
-    # Define the time lags to test 
-    sfreq = raw_learn_prob.info['sfreq']
-    min_lag_ms, max_lag_ms, step_ms = -100, 250, 10
-    lags_ms = np.arange(min_lag_ms, max_lag_ms + step_ms, step_ms)
-    lags_samples = (lags_ms / 1000 * sfreq).astype(int)
-    
-    tdlm_results = {}
-
-    #time to TDLM
-    for i in range(len(replay_sequence) - 1):
-        seed_item = replay_sequence[i]
-        target_item = replay_sequence[i+1]
-        transition_name = f"{seed_item.replace('.png','')} -> {target_item.replace('.png','')}"
+    # --- Step 1: Define the function to calculate "sequenceness" ---
+    def calculate_directional_sequenceness(evidence_df, sequence, lags_samples):
+        """
+        Calculates both forward and backward sequenceness strength.
+        Returns two arrays: (sequenceness_forward, sequenceness_backward)
+        """
+        n_items = len(sequence)
+        sequence_map = {item: i for i, item in enumerate(sequence)}
         
-        
-        seed_trace = evidence_df[seed_item].values
-        target_trace = evidence_df[target_item].values
-        
-        betas = []
+        # Idealized forward transition matrix (e.g., A->B, B->C)
+        T_forward = np.zeros((n_items, n_items))
+        for i in range(n_items - 1):
+            T_forward[sequence_map[sequence[i]], sequence_map[sequence[i+1]]] = 1
+            
+        sequenceness_forward = []
+        sequenceness_backward = []
+
+        # Reorder evidence_df columns to match the sequence order for matrix operations
+        evidence_reordered = evidence_df.loc[:, sequence].values
+
         for lag in lags_samples:
             max_abs_lag = np.abs(lags_samples).max()
-            Y = target_trace[max_abs_lag : -max_abs_lag]
-            start_idx = max_abs_lag - lag
-            end_idx = -max_abs_lag - lag
-            X = seed_trace[start_idx : end_idx]
             
-            slope, intercept, r_value, p_value, std_err = stats.linregress(X, Y)
-            betas.append(slope)
-        
-        tdlm_results[transition_name] = betas
+            y_t = evidence_reordered[max_abs_lag:-max_abs_lag]
+            y_t_lag = evidence_reordered[max_abs_lag - lag : -max_abs_lag - lag]
+            
+            T_empirical = y_t_lag.T @ y_t
+            T_empirical /= len(y_t)
 
-    #visualise the results
+            forward_match = np.sum(T_empirical * T_forward)
+            backward_match = np.sum(T_empirical * T_forward.T) # T_forward.T is the backward matrix
 
-    plt.figure(figsize=(12, 7))
+            sequenceness_forward.append(forward_match - backward_match)
+            sequenceness_backward.append(backward_match - forward_match)
+
+        return np.array(sequenceness_forward), np.array(sequenceness_backward)
+
+    # --- Step 2: Define parameters ---
+    sfreq = raw_learn_prob.info['sfreq']
+    min_lag_ms, max_lag_ms, step_ms = 10, 100, 10 # Focus on fast, plausible replay lags
+    lags_ms = np.arange(min_lag_ms, max_lag_ms + step_ms, step_ms)
+    lags_samples = (lags_ms / 1000 * sfreq).astype(int)
+
+    # --- Step 3: Analyze POST-learning rest ---
+    print("Analyzing POST-learning rest data...")
+    sequenceness_post, _ = calculate_directional_sequenceness(evidence_df, replay_sequence, lags_samples)
+
+    # --- Step 4: Analyze PRE-learning rest (the SANITY CHECK) ---
+    print("Analyzing PRE-learning rest data...")
+    sequenceness_pre, _ = calculate_directional_sequenceness(evidence_df_rest, replay_sequence, lags_samples)
+
+    # --- Step 5: Run Permutation Test to define significance threshold ---
+    print("Running permutation test to establish chance level...")
+    n_permutations = 500 # Use 500 for speed, 1000+ for publication
+    null_sequenceness = np.zeros(n_permutations)
     
-    for transition_name, betas in tdlm_results.items():
-        plt.plot(lags_ms, betas, label=transition_name, lw=2)
-        
-    plt.axhline(0, color='black', linestyle=':', lw=1, label='No Relationship (Beta=0)')
-    plt.axvline(0, color='black', linestyle='--', lw=1.5, label='Simultaneous Evidence (Lag=0)')
+    for i in range(n_permutations):
+        # Create a null distribution by shuffling the item labels in the sequence
+        shuffled_sequence = np.random.permutation(replay_sequence)
+        # Calculate sequenceness for the shuffled sequence on the real data.
+        # We use POST data as it's the longer recording and provides a stable baseline.
+        shuffled_seq_vals, _ = calculate_directional_sequenceness(evidence_df, shuffled_sequence, lags_samples)
+        # The test statistic is the maximum sequenceness across all lags
+        null_sequenceness[i] = np.max(shuffled_seq_vals)
     
-    plt.title(f'{sub} - TDLM Replay Analysis (Post-Learning Rest)')
-    plt.xlabel('Time Lag (ms) [Target - Seed]')
-    plt.ylabel('Beta Coefficient (Predictive Strength)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Significance threshold is the 95th percentile of the null distribution
+    threshold = np.percentile(null_sequenceness, 95)
+    print(f"Significance threshold (95th percentile) = {threshold:.4f}")
+
+    # --- Step 6: Count significant replay events ---
+    # We define an "event" as any time the sequenceness crosses the significance threshold
+    n_events_post = np.sum(np.max(sequenceness_post) > threshold)
+    n_events_pre = np.sum(np.max(sequenceness_pre) > threshold)
+    # A more continuous measure is the mean sequenceness above threshold
+    mean_sig_sequenceness_post = np.mean(sequenceness_post[sequenceness_post > threshold])
+    mean_sig_sequenceness_pre = np.mean(sequenceness_pre[sequenceness_pre > threshold])
+
+
+    # --- Step 7: Visualize and report the results ---
+    plt.figure(figsize=(14, 6))
+
+    # Plot Post-learning
+    ax1 = plt.subplot(1, 2, 1)
+    ax1.plot(lags_ms, sequenceness_post, 'o-', label='Post-Learning Sequenceness')
+    ax1.axhline(threshold, color='red', linestyle='--', label='Significance Threshold (p<0.05)')
+    ax1.set_title(f'POST-Learning Rest\n{n_events_post} Significant Event(s)')
+    ax1.set_xlabel('Time Lag (ms)')
+    ax1.set_ylabel('Forward Sequenceness')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Plot Pre-learning
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.plot(lags_ms, sequenceness_pre, 'o-', color='green', label='Pre-Learning Sequenceness')
+    ax2.axhline(threshold, color='red', linestyle='--', label='Significance Threshold (p<0.05)')
+    ax2.set_title(f'PRE-Learning Rest (Sanity Check)\n{n_events_pre} Significant Event(s)')
+    ax2.set_xlabel('Time Lag (ms)')
+    ax2.set_ylabel('Forward Sequenceness')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle(f'{sub} - Replay Event Detection Analysis', fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save the new plot
+    plot_path = os.path.join(sub_folder, f'{sub}_replay_event_detection.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.show()
 
-  
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     ########################################
-    # REST STATE                           #
+    # END OF TDLM ANALYSIS REST STATE      #
     ########################################
 
-    epochs_rest = mne.read_epochs(matching_files_reststate[0])
-    epochs_rest.plot(n_epochs=1, title=f"{sub} - postlearn RestState")
-    epochs_rest.plot_psd(fmin=1, fmax=40, average=True)
+
+    
+    # Filter epochs for 'forward' and 'backward' cues
+    epochs_forward = epochs_cued_stim[epochs_cued_stim.metadata['cue_direction'] == 'forward']
+    epochs_backward = epochs_cued_stim[epochs_cued_stim.metadata['cue_direction'] == 'backward']
+
+    # --- Step 2: Generate continuous evidence traces for each condition ---
+    # FORWARD-CUED TRIALS
+    data_fwd = epochs_forward.get_data()
+    data_continuous_fwd = data_fwd.transpose(1, 0, 2).reshape(data_fwd.shape[1], -1)
+    raw_fwd = mne.io.RawArray(data_continuous_fwd, epochs_forward.info)
+    X_fwd_reshaped = raw_fwd.get_data(picks='eeg').T
+    evidence_traces_fwd = tdlm_classifier.predict_proba(X_fwd_reshaped)
+    evidence_df_fwd = pd.DataFrame(evidence_traces_fwd, columns=class_labels, index=raw_fwd.times)
+    print("Generated evidence traces for FORWARD trials.")
+
+    # BACKWARD-CUED TRIALS
+    data_bwd = epochs_backward.get_data()
+    data_continuous_bwd = data_bwd.transpose(1, 0, 2).reshape(data_bwd.shape[1], -1)
+    raw_bwd = mne.io.RawArray(data_continuous_bwd, epochs_backward.info)
+    X_bwd_reshaped = raw_bwd.get_data(picks='eeg').T
+    evidence_traces_bwd = tdlm_classifier.predict_proba(X_bwd_reshaped)
+    evidence_df_bwd = pd.DataFrame(evidence_traces_bwd, columns=class_labels, index=raw_bwd.times)
+    print("Generated evidence traces for BACKWARD trials.")
+
+    # --- Step 3: Calculate directional sequenceness for each condition ---
+    # For forward-cued trials, we expect FORWARD sequenceness to be high
+    fwd_seq_fwd_trials, bwd_seq_fwd_trials = calculate_directional_sequenceness(evidence_df_fwd, replay_sequence, lags_samples)
+
+    # For backward-cued trials, we expect BACKWARD sequenceness to be high
+    fwd_seq_bwd_trials, bwd_seq_bwd_trials = calculate_directional_sequenceness(evidence_df_bwd, replay_sequence, lags_samples)
+
+    # --- Step 4: Visualize the results against the same significance threshold ---
+    # We re-use the threshold from the resting-state analysis as a consistent
+    # measure of chance-level sequenceness based on the data's intrinsic structure.
+    print(f"Using significance threshold from rest: {threshold:.4f}")
+
+    plt.figure(figsize=(14, 6))
+
+    # --- Plot for FORWARD-CUED trials ---
+    ax1 = plt.subplot(1, 2, 1)
+    ax1.plot(lags_ms, fwd_seq_fwd_trials, 'o-', label='Forward Sequenceness')
+    ax1.plot(lags_ms, bwd_seq_fwd_trials, 'o-', color='orange', label='Backward Sequenceness')
+    ax1.axhline(threshold, color='red', linestyle='--', label='Significance Threshold (p<0.05)')
+    ax1.set_title('Condition: FORWARD-Cued Trials')
+    ax1.set_xlabel('Time Lag (ms)')
+    ax1.set_ylabel('Sequenceness Score')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.axhline(0, color='black', lw=0.5, linestyle=':')
+
+    # --- Plot for BACKWARD-CUED trials ---
+    ax2 = plt.subplot(1, 2, 2)
+    ax2.plot(lags_ms, fwd_seq_bwd_trials, 'o-', label='Forward Sequenceness')
+    ax2.plot(lags_ms, bwd_seq_bwd_trials, 'o-', color='orange', label='Backward Sequenceness')
+    ax2.axhline(threshold, color='red', linestyle='--', label='Significance Threshold (p<0.05)')
+    ax2.set_title('Condition: BACKWARD-Cued Trials')
+    ax2.set_xlabel('Time Lag (ms)')
+    ax2.set_ylabel('Sequenceness Score')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.axhline(0, color='black', lw=0.5, linestyle=':')
+
+    plt.suptitle(f'{sub} - Directional Replay in Cued Mental Simulation', fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    
+    # Save the new plot
+    plot_path = os.path.join(sub_folder, f'{sub}_cued_replay_detection.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+    ######################################################
+    # VISUALIZING A REPLAY-TRIGGERED AVERAGE
+    ######################################################
+
+    print("\n--- Generating Replay-Triggered Average Plot ---")
+    
+    # We will use the FORWARD-cued trials, as this is where we would most
+    # expect to see a forward replay event.
+    
+    # --- Step 1: Find the trigger points ---
+    # A trigger is a moment when the evidence for the FIRST item in the
+    # sequence is very high.
+    
+    start_item = replay_sequence[0]
+    start_item_evidence = evidence_df_fwd[start_item].values
+    
+    # Define a high threshold to find strong activation peaks.
+    # The 95th percentile is a good choice.
+    trigger_threshold = np.percentile(start_item_evidence, 95)
+    
+    # Find the indices of all time points that cross this threshold.
+    trigger_indices = np.where(start_item_evidence > trigger_threshold)[0]
+    
+    # To avoid having overlapping events, we'll only keep the first index
+    # in any consecutive block of triggers.
+    if len(trigger_indices) > 0:
+        triggers = [trigger_indices[0]]
+        for i in range(1, len(trigger_indices)):
+            if trigger_indices[i] > trigger_indices[i-1] + 1:
+                triggers.append(trigger_indices[i])
+        trigger_indices = np.array(triggers)
+        print(f"Found {len(trigger_indices)} candidate replay event triggers.")
+    else:
+        print("No strong trigger events found for the first item. Cannot generate plot.")
+        trigger_indices = [] # Ensure it's an empty list if no triggers are found
+
+    # --- Step 2: Extract a window of data around each trigger ---
+    
+    # Define the window length for our plot (e.g., 200 ms)
+    window_duration_ms = 200
+    sfreq = raw_fwd.info['sfreq']
+    window_samples = int(window_duration_ms / 1000 * sfreq)
+    
+    event_windows = []
+    if len(trigger_indices) > 0:
+        for trigger_idx in trigger_indices:
+            # Ensure the window doesn't go past the end of the data
+            if trigger_idx + window_samples < len(evidence_df_fwd):
+                window = evidence_df_fwd.iloc[trigger_idx : trigger_idx + window_samples]
+                # Reorder columns to match the learned sequence
+                window = window[replay_sequence]
+                event_windows.append(window.values)
+
+    # --- Step 3: Average the windows and plot ---
+    if len(event_windows) > 0:
+        # Stack all windows into a 3D array and average them
+        averaged_event = np.mean(np.stack(event_windows, axis=0), axis=0)
+
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(8, 10))
+        
+        # Plot the heatmap
+        im = ax.imshow(averaged_event, cmap='afmhot', interpolation='bilinear', aspect='auto', vmin=0)
+        
+        # --- Customize Axes and Labels ---
+        # X-axis (States)
+        ax.set_xticks(np.arange(len(replay_sequence)))
+        ax.set_xticklabels([item.replace('.png','') for item in replay_sequence], fontsize=12)
+        ax.xaxis.tick_top()
+        
+        # Y-axis (Time)
+        ax.set_ylabel("Time from Event Onset (ms)", fontsize=14)
+        # Create meaningful time labels for the y-axis
+        tick_positions = np.linspace(0, window_samples, 5)
+        tick_labels = np.linspace(0, window_duration_ms, 5).astype(int)
+        ax.set_yticks(tick_positions)
+        ax.set_yticklabels(tick_labels)
+        
+        # Colorbar
+        cbar = fig.colorbar(im, ax=ax, shrink=0.5, pad=0.02)
+        cbar.set_label("Classifier Probability", fontsize=14, labelpad=10)
+        
+        # Title
+        ax.set_title(f"{sub} - Replay-Triggered Average\n(Averaged over {len(event_windows)} events)", fontsize=16, pad=20)
+        
+        # Save the new plot
+        plot_path = os.path.join(sub_folder, f'{sub}_replay_triggered_average.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.show()
+
+    else:
+        print("Could not generate the replay-triggered average plot because no trigger events were found.")
+
+
+    
+
+    print(f'analysis for {sub} completed')
+
+
+        
 
 
 
 
-    ########################################
-    # POSTLEARN REST STATE ANALYSIS        #
-    ########################################
-    epochs_learn_prob = mne.read_epochs(matching_files_learnprob[0])
-    epochs_learn_prob.plot(n_epochs=1, title=f"{sub} - postlearn RestState")
-    epochs_learn_prob.plot_psd(fmin=1, fmax=40, average=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

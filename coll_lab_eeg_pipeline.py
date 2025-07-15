@@ -602,6 +602,8 @@ def run_ica_label(
 
             # Set average reference (required for iclabel)
             ica_epo.set_eeg_reference("average")
+            
+            ica_epo_filtered = ica_epo.copy().filter(l_freq=1.0, h_freq=100.0, verbose=False)
 
             # Get ICA labels and probabilities
             icalabel = label_components(ica_epo, ica, method="iclabel")
