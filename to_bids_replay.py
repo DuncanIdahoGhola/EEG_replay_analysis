@@ -66,10 +66,10 @@ if not desc_file_path.exists():
 
 
 
-unwanted = ['sub-098']
+unwanted = []
+processed = ['sub-027', 'sub-099']
 
-
-already_bids = []
+already_bids = ['sub-027', 'sub-099']
 
 sub_directories = [Path(sub) for sub in sub_directories]
 
@@ -83,8 +83,8 @@ meta_frames_rest = []
 sub_meta_dir= [Path(sub) for sub in sub_meta_dir]
 
 for sub in sub_meta_dir: 
-        
-        if sub.name in unwanted :
+
+        if sub.name in unwanted or sub.name in processed:
             continue
         #find all files in path
         rest_state_dir = sub / 'rest_state' 
@@ -464,10 +464,12 @@ for sub in sub_directories:
         'key_resp_2.stopped': 'Timestamp for when the participant pressed a key to end the experiment.',
         'feedback_text_display.started': 'Timestamp for the onset of the feedback message display.',
         'feedback_text_display.stopped': 'Timestamp for the offset of the feedback message display.',
+        'key_resp_2.rt': 'Reaction time of the participant\'s key press to end the experiment, in seconds.',
 
         # == Feedback-related columns ==
         'feedback_message_to_show': 'The content of the feedback message prepared for display (may not have been shown).',
         'show_feedback_flag_value': 'A boolean flag indicating if feedback was scheduled to be shown for the trial.',
+        'key_resp_2.duration': 'Duration in seconds for which the key to end the experiment was held down.',
 
         # == General Experiment & Session Metadata ==
         'notes': 'Any manual notes recorded by the experimenter during the session.',
@@ -500,6 +502,10 @@ for sub in sub_directories:
     #drop the unnamed:106 column from the data frame
     if 'Unnamed: 106' in df_expanded_funcloc.columns:
         df_expanded_funcloc = df_expanded_funcloc.drop(columns=['Unnamed: 106'])
+
+    #drop the unnamed: 105  column from the data frame
+    if 'Unnamed: 105' in df_expanded_funcloc.columns:
+        df_expanded_funcloc = df_expanded_funcloc.drop(columns=['Unnamed: 105'])
     #reset index so it matches index in the orignal eeg files
     df_expanded_funcloc = df_expanded_funcloc.reset_index(drop=True)
 

@@ -19,12 +19,14 @@ from mne.decoding import Vectorizer, SlidingEstimator, cross_val_multiscore
 from scipy import stats 
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import confusion_matrix
+from scipy.signal import find_peaks
+
 
 
 
 #create a sub list
 
-sub = ['sub-027', 'sub-099']
+sub = ['sub-027','sub-098','sub-099']
 sub_permutation_done= ['sub-027'] #this list is used to check if the permutation test has been done for the subject
 
 #to start analysing data we first need to get all paths to the fif data that came out of our pipeline
@@ -197,6 +199,26 @@ for sub in sub :
     clf = make_pipeline(StandardScaler(), 
                         LogisticRegression(solver="liblinear", random_state=42))
     
+    # --- NEW: Generate a Confusion Matrix for Diagnostics ---
+    print(f"\n--- Generating Confusion Matrix for {sub} ---")
+    y_pred = cross_val_predict(pipeline, X, y, cv=cv, n_jobs=-1)
+
+    # Get the unique labels in the correct order for plotting
+    labels = sorted(y.unique())
+    conf_mx = confusion_matrix(y, y_pred, labels=labels)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_mx, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=labels, yticklabels=labels)
+    plt.title(f'Confusion Matrix for {sub}')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+
+    # Save the plot
+    plot_path = os.path.join(sub_folder, f'{sub}_confusion_matrix.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    
     # Create the SlidingEstimator instance. This object will slide a classifier along the time axis.
     # We use n_jobs=-1 to use all available CPU cores, which significantly speeds up the process.
     time_decoder = SlidingEstimator(clf, n_jobs=-1, scoring="accuracy", verbose=True)   
@@ -251,19 +273,38 @@ for sub in sub :
 
     joblib.dump(final_whole_epoch_model, model_path)
 
-    #we can also save the model at peak time
-    # Extract the data ONLY from the peak time point.
-    # The shape will go from (n_epochs, n_channels, n_times) to (n_epochs, n_channels)
-    X_peak_time = X[:, :, peak_index]
+    # We will create a more robust classifier by training on a small window (bin)
+    # of time points around the previously identified peak.
 
-    #pipeline with already 2d data
-    peak_time_pipeline = make_pipeline(
+    # Define the width of the time bin in milliseconds we can play around with this to see how good it is with different bin
+    bin_width_ms = 10
+    sfreq = epochs_func_loc.info['sfreq']
+    # Calculate the number of samples to average on each side of the peak
+    half_bin_width_samples = int((bin_width_ms / 1000 * sfreq) / 2)
+
+    # Define the start and end of the bin, ensuring we don't go out of bounds
+    start_idx = max(0, peak_index - half_bin_width_samples)
+    end_idx = min(X.shape[2], peak_index + half_bin_width_samples)
+
+    print(f"Creating binned data for training: from {epochs_func_loc.times[start_idx]:.3f}s to {epochs_func_loc.times[end_idx]:.3f}s")
+
+    # Extract the data within the bin and average across the time dimension
+    # Shape changes from (n_epochs, n_channels, n_time_points_in_bin) -> (n_epochs, n_channels)
+    X_peak_binned = X[:, :, start_idx:end_idx].mean(axis=2)
+
+    # Create the pipeline for the 2D (epochs, channels) binned data
+    peak_binned_pipeline = make_pipeline(
         StandardScaler(),
         LogisticRegression(solver='liblinear', random_state=42, max_iter=1000)
     )
-    final_peak_model = peak_time_pipeline.fit(X_peak_time, y)
-    peak_model_path = os.path.join(models_dir, f'{sub}_peak_time_{int(peak_time*1000)}ms_classifier.joblib')
-    joblib.dump(final_peak_model, peak_model_path)
+
+    # Fit the final model on the binned data
+    final_peak_binned_model = peak_binned_pipeline.fit(X_peak_binned, y)
+
+    # Save this new, more robust model
+    # The model name now reflects that it was trained on a bin.
+    peak_binned_model_path = os.path.join(models_dir, f'{sub}_peak_binned_{int(peak_time*1000)}ms_classifier.joblib')
+    joblib.dump(final_peak_binned_model, peak_binned_model_path)
 
 
     #we can now use the trained models on unseen data
@@ -271,7 +312,6 @@ for sub in sub :
     #we now have our accuracy scores for the whole epoch and time resolved decoding
     #we know how accurate our model is and when it is most accurate
     #we can now go and check the temporal information linked to the classification
-
     # The SlidingEstimator will apply our classifier at each time point.
     time_decoder_proba = SlidingEstimator(clf, n_jobs=-1, scoring=None, verbose=True)
     # Use cross_val_predict to get the probabilities for each trial.
@@ -365,10 +405,10 @@ for sub in sub :
     replay_sequence = [new_image_file_map[item] for item in reconstructed_sequence]
 
 
-    # Step A: Load the trained classifier
-    peak_model_path = os.path.join(models_dir, f'{sub}_peak_time_{int(peak_time*1000)}ms_classifier.joblib')
-    tdlm_classifier = joblib.load(peak_model_path)
-    class_labels = tdlm_classifier[-1].classes_
+    # Step A: Load the trained, bin-averaged classifier
+    peak_binned_model_path = os.path.join(models_dir, f'{sub}_peak_binned_{int(peak_time*1000)}ms_classifier.joblib')
+    tdlm_classifier = joblib.load(peak_binned_model_path)
+    class_labels = tdlm_classifier.named_steps['logisticregression'].classes_
 
     # Step B: Generate evidence trace for POST-learning rest
     epochs_learn_prob = mne.read_epochs(matching_files_learnprob[0], preload=True)
@@ -583,41 +623,34 @@ for sub in sub :
 
     print("\n--- Generating Replay-Triggered Average Plot ---")
     
-    # We will use the FORWARD-cued trials, as this is where we would most
-    # expect to see a forward replay event.
-    
-    # --- Step 1: Find the trigger points ---
-    # A trigger is a moment when the evidence for the FIRST item in the
-    # sequence is very high.
-    
+    # We will use the FORWARD-cued trials data for this visualization.
     start_item = replay_sequence[0]
     start_item_evidence = evidence_df_fwd[start_item].values
     
-    # Define a high threshold to find strong activation peaks.
-    # The 95th percentile is a good choice.
+    # --- Step 1: Find the trigger points using peak detection ---
+    # Define the threshold for peak detection (same as before)
     trigger_threshold = np.percentile(start_item_evidence, 95)
     
-    # Find the indices of all time points that cross this threshold.
-    trigger_indices = np.where(start_item_evidence > trigger_threshold)[0]
+    # Define a minimum distance between peaks to avoid multiple triggers on one event.
+    # A 50ms distance is a good starting point.
+    sfreq = raw_fwd.info['sfreq']
+    min_peak_distance_ms = 50
+    min_peak_distance_samples = int(min_peak_distance_ms / 1000 * sfreq)
+
+    # Use find_peaks to get the indices of the sharp onsets
+    trigger_indices, _ = find_peaks(
+        start_item_evidence, 
+        height=trigger_threshold, 
+        distance=min_peak_distance_samples
+    )
     
-    # To avoid having overlapping events, we'll only keep the first index
-    # in any consecutive block of triggers.
     if len(trigger_indices) > 0:
-        triggers = [trigger_indices[0]]
-        for i in range(1, len(trigger_indices)):
-            if trigger_indices[i] > trigger_indices[i-1] + 1:
-                triggers.append(trigger_indices[i])
-        trigger_indices = np.array(triggers)
-        print(f"Found {len(trigger_indices)} candidate replay event triggers.")
+        print(f"Found {len(trigger_indices)} distinct replay event triggers using peak detection.")
     else:
-        print("No strong trigger events found for the first item. Cannot generate plot.")
-        trigger_indices = [] # Ensure it's an empty list if no triggers are found
+        print("No distinct trigger peaks found. Cannot generate plot.")
 
     # --- Step 2: Extract a window of data around each trigger ---
-    
-    # Define the window length for our plot (e.g., 200 ms)
     window_duration_ms = 200
-    sfreq = raw_fwd.info['sfreq']
     window_samples = int(window_duration_ms / 1000 * sfreq)
     
     event_windows = []
@@ -626,52 +659,73 @@ for sub in sub :
             # Ensure the window doesn't go past the end of the data
             if trigger_idx + window_samples < len(evidence_df_fwd):
                 window = evidence_df_fwd.iloc[trigger_idx : trigger_idx + window_samples]
-                # Reorder columns to match the learned sequence
-                window = window[replay_sequence]
-                event_windows.append(window.values)
+                # Reorder columns to match the learned sequence for correct plotting
+                aligned_window = window[replay_sequence] 
+                
+                event_windows.append(aligned_window.values)
 
-    # --- Step 3: Average the windows and plot ---
+    # --- Step 3: Average the windows and create the plot ---
     if len(event_windows) > 0:
         # Stack all windows into a 3D array and average them
         averaged_event = np.mean(np.stack(event_windows, axis=0), axis=0)
 
-        # Create the plot
         fig, ax = plt.subplots(figsize=(8, 10))
         
-        # Plot the heatmap
-        im = ax.imshow(averaged_event, cmap='afmhot', interpolation='bilinear', aspect='auto', vmin=0)
+        # Plot the heatmap without artificial smoothing (interpolation='none')
+        im = ax.imshow(averaged_event, cmap='afmhot', interpolation='none', 
+                       aspect='auto', origin='upper', vmin=0)
         
         # --- Customize Axes and Labels ---
-        # X-axis (States)
+        ax.set_title(f"{sub} - Replay-Triggered Average\n(Averaged over {len(event_windows)} peak events)", fontsize=16, pad=20)
+        
+        # X-axis (The items in the sequence)
         ax.set_xticks(np.arange(len(replay_sequence)))
         ax.set_xticklabels([item.replace('.png','') for item in replay_sequence], fontsize=12)
         ax.xaxis.tick_top()
+        ax.xaxis.set_label_position('top')
+        ax.set_xlabel("Sequence Item", fontsize=14, labelpad=10)
         
         # Y-axis (Time)
-        ax.set_ylabel("Time from Event Onset (ms)", fontsize=14)
-        # Create meaningful time labels for the y-axis
-        tick_positions = np.linspace(0, window_samples, 5)
+        ax.set_ylabel("Time from Peak Onset (ms)", fontsize=14)
+        tick_positions = np.linspace(0, window_samples - 1, 5)
         tick_labels = np.linspace(0, window_duration_ms, 5).astype(int)
         ax.set_yticks(tick_positions)
         ax.set_yticklabels(tick_labels)
         
         # Colorbar
-        cbar = fig.colorbar(im, ax=ax, shrink=0.5, pad=0.02)
+        cbar = fig.colorbar(im, ax=ax, shrink=0.6, pad=0.03)
         cbar.set_label("Classifier Probability", fontsize=14, labelpad=10)
         
-        # Title
-        ax.set_title(f"{sub} - Replay-Triggered Average\n(Averaged over {len(event_windows)} events)", fontsize=16, pad=20)
-        
         # Save the new plot
-        plot_path = os.path.join(sub_folder, f'{sub}_replay_triggered_average.png')
+        plot_path = os.path.join(sub_folder, f'{sub}_replay_triggered_average_peaked.png')
+        plt.tight_layout()
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.show()
 
     else:
-        print("Could not generate the replay-triggered average plot because no trigger events were found.")
-
-
+        print("Could not generate the replay-triggered average plot because no trigger peaks were found.")
+    ######################################################
+    # SAVE NUMERICAL RESULTS FOR GROUP ANALYSIS
+    ######################################################
+    # Create a dictionary to hold all the important results
+    results_to_save = {
+        'lags_ms': lags_ms,
+        'post_learn_rest': sequenceness_post,
+        'pre_learn_rest': sequenceness_pre,
+        'cued_fwd_forward_seq': fwd_seq_fwd_trials,
+        'cued_fwd_backward_seq': bwd_seq_fwd_trials,
+        'cued_bwd_forward_seq': fwd_seq_bwd_trials,
+        'cued_bwd_backward_seq': bwd_seq_bwd_trials,
+        'significance_threshold': threshold, 
+        'replay_event_windows': np.array(event_windows) if len(event_windows) > 0 else np.array([]),
+        'replay_sequence_items': np.array(replay_sequence)
+    }
     
+    # Define the output path in the subject's analysis folder
+    results_path = os.path.join(sub_folder, f'{sub}_sequenceness_results.npz')
+    
+    # Save the dictionary to a compressed .npz file
+    np.savez(results_path, **results_to_save)
 
     print(f'analysis for {sub} completed')
 

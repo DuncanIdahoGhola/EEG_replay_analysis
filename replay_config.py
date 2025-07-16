@@ -29,7 +29,6 @@
 
 
 
-
 #find venv - cd C:\Users\labmp\Desktop\EEG_analysis_replay
 # e:\EEG_analysis_replay
 
@@ -82,7 +81,7 @@ tasks_to_process = ['cuedstim',
 #config_validation: mne-bids-pipeline config validation. Leave to False because we use custom options.
 config_validation = 'warn'
 # subjects: List of subjects to process or 'all' to process all subjects.
-subjects = 'all'
+subjects = ['098']
 # sessions: List of sessions to process or leave empty to pcrocess all sessions.
 sessions = []
 #task: Task to process. This will be updated iteratively by the pipeline for each task. No need to change.
