@@ -6,125 +6,157 @@ from scipy import stats
 import mne # We'll use MNE for its powerful stats functions
 
 # --- 1. SETUP ---
-subjects = ['sub-027', 'sub-099', 'sub-098'] # Add all subjects
+subjects = ['sub-027', 'sub-098', 'sub-099'] # Add all subjects
 root = os.getcwd()
 deriv_root = os.path.join(root, 'analyse_deriv')
+group_deriv_root = os.path.join(deriv_root, 'group_level')
+os.makedirs(group_deriv_root, exist_ok=True)
 
-# --- 2. AGGREGATE DATA ---
-all_post_rest, all_cued_fwd_fwd, all_cued_bwd_bwd, all_event_windows = [], [], [], []
+bin_width_ms = 10
+
+# --- 2. DATA COLLECTION LOOP ---
+all_post_rest, all_cued_fwd_fwd, all_cued_bwd_bwd = [], [], []
+subject_fwd_event_windows, subject_bwd_event_windows = [], []
 lags_ms = None
+replay_sequence_items = None
+n_sequence_items = None
 
-print("Loading data for all subjects...")
+print("--- Starting Data Collection ---")
 for sub in subjects:
-    file_path = os.path.join(deriv_root, sub, f'{sub}_sequenceness_results.npz')
+    file_path = os.path.join(deriv_root, sub, f'{sub}_sequenceness_results_binned.npz')
+    
     if os.path.exists(file_path):
+        print(f"Loading data for {sub}...")
         data = np.load(file_path, allow_pickle=True)
         
-        if lags_ms is None:
-            lags_ms = data['lags_ms']
+        if lags_ms is None: lags_ms = data['lags_ms']
+        if replay_sequence_items is None: 
+            replay_sequence_items = data['replay_sequence_items']
+            n_sequence_items = len(replay_sequence_items)
+
         all_post_rest.append(data['post_learn_rest'])
         all_cued_fwd_fwd.append(data['cued_fwd_forward_seq'])
         all_cued_bwd_bwd.append(data['cued_bwd_backward_seq'])
         
-        if 'replay_event_windows' in data and data['replay_event_windows'].size > 0:
-            all_event_windows.append(data['replay_event_windows'])
+        if 'forward_cued_event_windows' in data and data['forward_cued_event_windows'].size > 0:
+            subject_fwd_event_windows.append(data['forward_cued_event_windows'])
+        
+        if 'backward_cued_event_windows' in data and data['backward_cued_event_windows'].size > 0:
+            subject_bwd_event_windows.append(data['backward_cued_event_windows'])
     else:
-        print(f"Warning: Could not find results file for {sub}")
+        print(f"Warning: Could not find results file for {sub} at {file_path}")
+
+print("--- Data Collection Finished ---")
+
+# --- 3. DATA AGGREGATION & ANALYSIS ---
+print("\n--- Aggregating and Analyzing Group Data ---")
 
 all_post_rest = np.array(all_post_rest)
 all_cued_fwd_fwd = np.array(all_cued_fwd_fwd)
 all_cued_bwd_bwd = np.array(all_cued_bwd_bwd)
 
-if all_event_windows:
-    grand_average_windows = np.concatenate(all_event_windows, axis=0)
-    print(f"Aggregated a total of {grand_average_windows.shape[0]} replay events across {len(subjects)} subjects.")
-else:
-    grand_average_windows = None
-    print("No replay event windows found to create a group heatmap.")
+grand_average_fwd_windows = np.vstack(subject_fwd_event_windows) if subject_fwd_event_windows else None
+grand_average_bwd_windows = np.vstack(subject_bwd_event_windows) if subject_bwd_event_windows else None
 
-
-# --- 3. GROUP-LEVEL TDLM PLOTS ---
-# (This section can remain unchanged, as it correctly analyzes the quantitative data)
-def plot_group_sequenceness(data, lags, title, ax):
+# --- 4. GROUP-LEVEL TDLM PLOTS (Quantitative) ---
+def plot_group_sequenceness(data, lags, title, ax, ylabel='Sequenceness Score'):
     n_subjects = data.shape[0]
     if n_subjects < 2:
-        ax.set_title(f"{title}\n(Not enough data)")
+        ax.set_title(f"{title}\n(Not enough data: {n_subjects} subjects)")
         return
-
+        
     mean_seq, sem_seq = np.mean(data, axis=0), stats.sem(data, axis=0)
     
+    # <<< STATISTICAL ANALYSIS RESTORED >>>
+    # This block was missing and is now added back.
     try:
-        _, clusters, cluster_p_values, _ = mne.stats.permutation_cluster_1samp_test(
+        # We test against 0 (chance) and use a one-tailed test because our hypothesis is directional (sequenceness > 0)
+        t_obs, clusters, cluster_p_values, H0 = mne.stats.permutation_cluster_1samp_test(
             data, n_permutations=1024, tail=1, n_jobs=-1
         )
-        for i_c, c in enumerate(clusters):
-            if cluster_p_values[i_c] < 0.05:
-                c = c[0]
-                ax.axvspan(lags[c.start], lags[c.stop-1], color='red', alpha=0.3, 
-                           label=f'p={cluster_p_values[i_c]:.3f}')
-    except Exception:
-        pass # Ignore stats errors if data is not suitable
+        
+        # Find clusters with p-value less than 0.05
+        sig_clusters = [c[0] for i, c in enumerate(clusters) if cluster_p_values[i] < 0.05]
+        
+        if sig_clusters:
+            # Create a single legend entry for all significant clusters
+            ax.axvspan(0, 0, color='red', alpha=0.3, label='p < 0.05 (cluster-corrected)')
+            # Shade the significant time lags
+            for clst in sig_clusters:
+                ax.axvspan(lags[clst.start], lags[clst.stop-1], color='red', alpha=0.3)
+    except Exception as e:
+        print(f"Could not run cluster stats for '{title}': {e}")
+    # <<< END OF RESTORED BLOCK >>>
 
     ax.axhline(0, color='black', lw=0.5)
     ax.plot(lags, mean_seq, 'o-', label=f'Mean (N={n_subjects})')
     ax.fill_between(lags, mean_seq - sem_seq, mean_seq + sem_seq, alpha=0.2, label='SEM')
     ax.set_title(title)
     ax.set_xlabel('Time Lag (ms)')
-    ax.set_ylabel('Sequenceness Score')
+    ax.set_ylabel(ylabel)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
 fig_tdlm, axes_tdlm = plt.subplots(1, 3, figsize=(20, 6), sharey=True)
-fig_tdlm.suptitle('Group-Level TDLM Analysis', fontsize=16)
-plot_group_sequenceness(all_post_rest, lags_ms, 'Spontaneous Replay (Post-Learn Rest)', axes_tdlm[0])
-plot_group_sequenceness(all_cued_fwd_fwd, lags_ms, 'Forward Replay (Forward Cue)', axes_tdlm[1])
-axes_tdlm[2].set_ylabel('Backward Sequenceness Score')
-plot_group_sequenceness(all_cued_bwd_bwd, lags_ms, 'Backward Replay (Backward Cue)', axes_tdlm[2])
+fig_tdlm.suptitle('Group-Level TDLM Analysis (Binned)', fontsize=16)
+plot_group_sequenceness(all_post_rest, lags_ms, 'Spontaneous Replay (Post-Learn Rest)', axes_tdlm[0], ylabel='Forward Sequenceness')
+plot_group_sequenceness(all_cued_fwd_fwd, lags_ms, 'Forward Replay (Forward Cue)', axes_tdlm[1], ylabel='Forward Sequenceness')
+plot_group_sequenceness(all_cued_bwd_bwd, lags_ms, 'Backward Replay (Backward Cue)', axes_tdlm[2], ylabel='Backward Sequenceness')
 fig_tdlm.tight_layout(rect=[0, 0.03, 1, 0.95])
-fig_tdlm.savefig(os.path.join(deriv_root, 'group_tdlm_analysis.png'), dpi=300)
+fig_tdlm.savefig(os.path.join(group_deriv_root, 'group_tdlm_analysis_binned.png'), dpi=300)
 plt.show()
 
 
-# --- 4. GROUP-LEVEL REPLAY-TRIGGERED HEATMAP (ORDINAL) ---
-
-if grand_average_windows is not None:
-    # Calculate the grand average across all ALIGNED events
-    grand_averaged_event = np.mean(grand_average_windows, axis=0)
-    
+# --- 5. GROUP-LEVEL REPLAY-TRIGGERED HEATMAPS (Directional) ---
+def plot_group_heatmap(event_windows, subject_event_list, sequence_labels, title_prefix, output_filename, bin_width):
+    if event_windows is None or event_windows.size == 0:
+        print(f"No valid replay event windows found for '{title_prefix}'. Skipping heatmap.")
+        return
+    grand_averaged_event = np.mean(event_windows, axis=0)
+    n_subjects_with_events = len([s for s in subject_event_list if s.size > 0])
+    n_total_events = event_windows.shape[0]
     n_sequence_items = grand_averaged_event.shape[1]
-    window_samples = grand_averaged_event.shape[0]
-    sfreq = 500 # Assume 500 Hz from your config
-    window_duration_ms = window_samples / sfreq * 1000
+    window_bins = grand_averaged_event.shape[0]
 
-    fig_heatmap, ax_heatmap = plt.subplots(figsize=(8, 10))
+    fig_heatmap, ax_heatmap = plt.subplots(figsize=(8, 6))
+    x_axis = np.arange(n_sequence_items + 1)
+    y_axis = np.arange(window_bins + 1) * bin_width
     
-    im = ax_heatmap.imshow(grand_averaged_event, cmap='afmhot', interpolation='none', 
-                           aspect='auto', origin='upper', vmin=0)
+    chance_level_heatmap = 1 / n_sequence_items
+    im = ax_heatmap.pcolormesh(x_axis, y_axis, grand_averaged_event, cmap='afmhot', vmin=chance_level_heatmap)
     
-    # --- Customize Axes and Labels for ORDINAL positions ---
-    ax_heatmap.set_title(f"Group Replay-Triggered Average\n(Averaged over {grand_average_windows.shape[0]} events from {len(subjects)} subjects)", 
-                         fontsize=16, pad=20)
-    
-    # X-axis: Use ordinal labels
-    ordinal_labels = [f'Stim {i+1}' for i in range(n_sequence_items)]
-    ax_heatmap.set_xticks(np.arange(n_sequence_items))
-    ax_heatmap.set_xticklabels(ordinal_labels, fontsize=12)
-    ax_heatmap.xaxis.tick_top()
-    ax_heatmap.xaxis.set_label_position('top')
-    ax_heatmap.set_xlabel("Ordinal Position in Sequence", fontsize=14, labelpad=10)
-    
-    # Y-axis
-    ax_heatmap.set_ylabel("Time from Peak Onset (ms)", fontsize=14)
-    tick_positions = np.linspace(0, window_samples - 1, 5)
-    tick_labels = np.linspace(0, window_duration_ms, 5).astype(int)
-    ax_heatmap.set_yticks(tick_positions)
-    ax_heatmap.set_yticklabels(tick_labels)
-    
-    # Colorbar
-    cbar = fig_heatmap.colorbar(im, ax=ax_heatmap, shrink=0.6, pad=0.03)
-    cbar.set_label("Classifier Probability", fontsize=14, labelpad=10)
-    
-    # Save the plot
+    title = (f"Group {title_prefix} Replay-Triggered Average\n"
+             f"(Averaged over {n_total_events} events from {n_subjects_with_events} subjects)")
+    ax_heatmap.set_title(title, fontsize=14)
+    ax_heatmap.set_xticks(np.arange(n_sequence_items) + 0.5)
+    ax_heatmap.set_xticklabels([label.replace('.png','') for label in sequence_labels], fontsize=12)
+    ax_heatmap.set_xlabel("Expected Sequence Item", fontsize=12)
+    ax_heatmap.set_ylabel("Time from Trigger Onset (ms)", fontsize=12)
+    ax_heatmap.invert_yaxis()
+    cbar = fig_heatmap.colorbar(im, ax=ax_heatmap)
+    cbar.set_label("Classifier Probability", fontsize=12)
     fig_heatmap.tight_layout()
-    fig_heatmap.savefig(os.path.join(deriv_root, 'group_ordinal_replay_triggered_average.png'), dpi=300)
+    fig_heatmap.savefig(output_filename, dpi=300)
     plt.show()
+
+# --- Call the plotting function for each condition ---
+if replay_sequence_items is not None:
+    print("\n--- Generating Group Heatmaps ---")
+    plot_group_heatmap(
+        grand_average_fwd_windows,
+        subject_event_list=subject_fwd_event_windows,
+        sequence_labels=replay_sequence_items,
+        title_prefix='Forward-Cued',
+        output_filename=os.path.join(group_deriv_root, 'group_forward_replay_triggered_average_binned.png'),
+        bin_width=bin_width_ms
+    )
+    plot_group_heatmap(
+        grand_average_bwd_windows,
+        subject_event_list=subject_bwd_event_windows,
+        sequence_labels=list(reversed(replay_sequence_items)),
+        title_prefix='Backward-Cued',
+        output_filename=os.path.join(group_deriv_root, 'group_backward_replay_triggered_average_binned.png'),
+        bin_width=bin_width_ms
+    )
+else:
+    print("Cannot generate heatmaps because replay_sequence_items was not loaded.")
